@@ -24,7 +24,10 @@ def safe_tanh(x: np.ndarray) -> np.ndarray:
     return np.tanh(np.clip(x, -10.0, 10.0)).astype(np.float32)
 
 def safe_matmul(a: np.ndarray, b: np.ndarray) -> np.ndarray:
-    y = a @ b
+    a_clean = np.nan_to_num(a, nan=0.0, posinf=1e3, neginf=-1e3).astype(np.float32)
+    b_clean = np.nan_to_num(b, nan=0.0, posinf=1e3, neginf=-1e3).astype(np.float32)
+    with np.errstate(invalid='ignore', over='ignore', divide='ignore'):
+        y = a_clean @ b_clean
     y = np.nan_to_num(y, nan=0.0, posinf=1e6, neginf=-1e6).astype(np.float32)
     return y
 
@@ -158,7 +161,7 @@ class ReliabilityTracker:
 class TeacherCfg:
     T0: float = 1.0; lam: float = 1.0; gamma: float = 1.0; Tmin: float = 0.7; Tmax: float = 1.8
     topk: int = 40
-    danger_rho_thr: float = 0.6
+    danger_rho_thr: float = 0.8
 
 class SpiralTeacher:
     def __init__(self, V: int, d: int, H: int, L: int, r: int, P: np.ndarray, cfg: TeacherCfg, seed: int = 0):
@@ -261,7 +264,16 @@ class SpiralTeacher:
         # layer hazard & keep-k suggestion from reliability
         xz, stab, expl = self.rel.layer_stats(stab_thr=1.5)
         for l in range(self.L):
-            rho_layer = float(np.mean(expl[l]) / (np.mean(stab[l]) + 1e-6))  # more explorers ⇒ higher hazard
+            expl_frac = float(np.mean(expl[l]))
+            stab_frac = float(np.mean(stab[l]))
+            total = max(expl_frac + stab_frac, 1e-6)
+            rho_layer = expl_frac / total  # normalized explorer ratio in [0,1]
+            # down-weight hazard while reliability counts are still low
+            mean_n = float(np.mean(self.rel.n[l]))
+            count_scale = min(1.0, mean_n / 5.0)
+            rel_level = float(np.mean(self.rel.y[l]))
+            rel_scale = min(1.0, rel_level / 1.5)  # only trust hazard once precision stabilizes
+            rho_layer *= (count_scale * rel_scale)
             layer_hazard[l] = rho_layer
             keepk_suggest[l] = int(np.clip( (1.0 + rho_layer) * (self.fusers[0].r // 2), 2, self.fusers[0].r))
 
@@ -404,7 +416,7 @@ class UncertaintyLR:
 @dataclass
 class StudentCfg:
     L: int = 4; d: int = 64; k: int = 16; V: int = 64; r: int = 16
-    base_lr: float = 3e-3; head_lr: float = 3e-3; emb_lr: float = 3e-3
+    base_lr: float = 1e-2; head_lr: float = 1e-2; emb_lr: float = 1e-2
     grad_target: float = 0.02
     seed: int = 123
 
@@ -420,7 +432,12 @@ class StudentV9:
         self._keepk = np.full((cfg.L,), max(2, cfg.k // 2), dtype=np.int32)
 
     def set_keepk_layerwise(self, keepk: np.ndarray):
-        self._keepk = keepk.astype(np.int32).copy()
+        # Accept keepk arrays shorter/longer than student depth and broadcast safely.
+        kk = np.clip(keepk.astype(np.int32), 2, self.cfg.k)
+        if kk.size < self.cfg.L:
+            pad_val = kk[-1] if kk.size > 0 else max(2, self.cfg.k // 2)
+            kk = np.concatenate([kk, np.full((self.cfg.L - kk.size,), pad_val, dtype=np.int32)])
+        self._keepk = kk[: self.cfg.L].copy()
 
     def forward(self, tokens: np.ndarray) -> Tuple[np.ndarray, Dict[str, Any]]:
         x = self.embed.forward(tokens)  # [B,T,d]
@@ -541,9 +558,9 @@ class TrainCfg:
     # distillation weight (single membrane for compactness)
     lam_distil: float = 0.5
     # reliability → rho nudging
-    lr_k_stab: float = 0.02; lr_k_expl: float = 0.03
+    lr_k_stab: float = 0.02; lr_k_expl: float = 0.01
     # hazard → partial optimize
-    keepk_boost: int = 4; rho_boost: float = 0.5
+    keepk_boost: int = 2; rho_boost: float = 0.0
     # T backprop switch & scale
     backprop_T: bool = True; T_grad_scale: float = 0.1
 
@@ -611,6 +628,8 @@ class SpiralV9:
                 if hazard[l_t] > self.teacher.cfg.danger_rho_thr:
                     keepk_new[l] = int(np.clip(keepk_new[l] + cfg.keepk_boost, 2, self.student.cfg.k))
                     self.student.u.rho[l] += cfg.rho_boost  # reduce LR
+            # re-clamp after hazard nudging to prevent runaway shrinkage of learning rate
+            self.student.u.rho = np.clip(self.student.u.rho, -2.0, 2.0)
             self.student.set_keepk_layerwise(keepk_new)
 
             # logging
@@ -632,8 +651,8 @@ def demo():
     eng = SpiralV9(V=64, d=64, H=3, L=3, r=16, seed=0)
     cfg = TrainCfg(steps=20, batch=16, ctx_len=8,
                    T0=1.0, lam=1.0, gamma=1.0, Tmin=0.7, Tmax=1.8, topk=32,
-                   lam_distil=0.5, lr_k_stab=0.02, lr_k_expl=0.03,
-                   keepk_boost=4, rho_boost=0.5, backprop_T=True, T_grad_scale=0.1)
+                   lam_distil=0.5, lr_k_stab=0.02, lr_k_expl=0.01,
+                   keepk_boost=2, rho_boost=0.0, backprop_T=True, T_grad_scale=0.1)
     logs = eng.train(cfg)
     print("== SpiralFullFusion V9 (compact) Demo — DONE ==")
     return logs
