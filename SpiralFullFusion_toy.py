@@ -17,7 +17,7 @@ def softmax_rows(Z: np.ndarray) -> np.ndarray:
     S = E / np.maximum(E.sum(axis=-1, keepdims=True), EPS)
     return S.astype(np.float32)
 
-GRAD_BOOST = 20.0  # amplify toy gradients so the student actually moves
+GRAD_BOOST = 5.0  # amplify toy gradients so the student actually moves
 
 def silu(x: np.ndarray) -> np.ndarray:
     return (x / (1.0 + np.exp(-np.clip(x, -20.0, 20.0)))).astype(np.float32)
@@ -268,14 +268,12 @@ class SpiralTeacher:
         for l in range(self.L):
             expl_frac = float(np.mean(expl[l]))
             stab_frac = float(np.mean(stab[l]))
-            total = max(expl_frac + stab_frac, 1e-6)
-            rho_layer = expl_frac / total  # normalized explorer ratio in [0,1]
-            # down-weight hazard while reliability counts are still low
-            mean_n = float(np.mean(self.rel.n[l]))
-            count_scale = min(1.0, mean_n / 5.0)
+            dom_z = float(np.mean(xz[l]))
+            # hazard rises when explorers dominate and dominance is high; smoothed via sigmoid
+            raw = (expl_frac - stab_frac) + 0.2 * dom_z
             rel_level = float(np.mean(self.rel.y[l]))
-            rel_scale = min(1.0, rel_level / 1.5)  # only trust hazard once precision stabilizes
-            rho_layer *= (count_scale * rel_scale)
+            conf = 1.0 / (1.0 + np.exp(-rel_level + 0.5))  # confidence from reliability
+            rho_layer = conf * (1.0 / (1.0 + np.exp(-3.0 * raw)))
             layer_hazard[l] = rho_layer
             keepk_suggest[l] = int(np.clip( (1.0 + rho_layer) * (self.fusers[0].r // 2), 2, self.fusers[0].r))
 
@@ -473,7 +471,7 @@ class StudentV9:
     def step(self):
         # Adapt the effective LR to keep gradient magnitudes near a target.
         g_rms = float(np.mean(self.grad_rms()))
-        g_scale = float(np.clip(self.cfg.grad_target / max(g_rms, 1e-6), 0.2, 100.0))
+        g_scale = float(np.clip(self.cfg.grad_target / max(g_rms, 1e-6), 0.2, 10.0))
         base = self.cfg.base_lr * g_scale
         etas = self.u.eta(base)
         for l, blk in enumerate(self.blocks):
@@ -654,11 +652,23 @@ class SpiralV9:
         return logs
 
 # ------------------------------
-# Demo
+# Demo / CLI
 # ------------------------------
-def demo():
-    eng = SpiralV9(V=64, d=64, H=3, L=3, r=16, seed=0)
-    cfg = TrainCfg(steps=100, batch=16, ctx_len=8,
+def demo(args=None):
+    import argparse
+    p = argparse.ArgumentParser(description="SpiralFullFusion toy demo")
+    p.add_argument("--steps", type=int, default=100)
+    p.add_argument("--batch", type=int, default=16)
+    p.add_argument("--ctx_len", type=int, default=8)
+    p.add_argument("--V", type=int, default=64)
+    p.add_argument("--d", type=int, default=64)
+    p.add_argument("--H", type=int, default=3)
+    p.add_argument("--L", type=int, default=3)
+    p.add_argument("--r", type=int, default=16)
+    parsed = p.parse_args(args=args)
+
+    eng = SpiralV9(V=parsed.V, d=parsed.d, H=parsed.H, L=parsed.L, r=parsed.r, seed=0)
+    cfg = TrainCfg(steps=parsed.steps, batch=parsed.batch, ctx_len=parsed.ctx_len,
                    T0=1.0, lam=1.0, gamma=1.0, Tmin=0.7, Tmax=1.8, topk=32,
                    lam_distil=0.5, lr_k_stab=0.02, lr_k_expl=0.01,
                    keepk_boost=2, rho_boost=0.0, backprop_T=True, T_grad_scale=0.1)
