@@ -17,7 +17,7 @@ def softmax_rows(Z: np.ndarray) -> np.ndarray:
     S = E / np.maximum(E.sum(axis=-1, keepdims=True), EPS)
     return S.astype(np.float32)
 
-GRAD_BOOST = 20.0  # amplify toy gradients so the student actually moves
+GRAD_BOOST = 25.0  # amplify toy gradients so the student actually moves
 
 def silu(x: np.ndarray) -> np.ndarray:
     return (x / (1.0 + np.exp(-np.clip(x, -20.0, 20.0)))).astype(np.float32)
@@ -438,7 +438,7 @@ class UncertaintyLR:
 class StudentCfg:
     L: int = 4; d: int = 64; k: int = 16; V: int = 64; r: int = 16
     base_lr: float = 1e-2; head_lr: float = 1e-2; emb_lr: float = 1e-2
-    grad_target: float = 0.1
+    grad_target: float = 0.15
     seed: int = 123
 
 class StudentV9:
