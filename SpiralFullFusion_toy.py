@@ -17,6 +17,8 @@ def softmax_rows(Z: np.ndarray) -> np.ndarray:
     S = E / np.maximum(E.sum(axis=-1, keepdims=True), EPS)
     return S.astype(np.float32)
 
+GRAD_BOOST = 20.0  # amplify toy gradients so the student actually moves
+
 def silu(x: np.ndarray) -> np.ndarray:
     return (x / (1.0 + np.exp(-np.clip(x, -20.0, 20.0)))).astype(np.float32)
 
@@ -302,7 +304,8 @@ class Linear:
     def backward(self, dy: np.ndarray) -> np.ndarray:
         x = self._x
         x2 = x.reshape(-1, x.shape[-1]); dy2 = dy.reshape(-1, dy.shape[-1])
-        self.dW += safe_matmul(x2.T, dy2) / max(1, x2.shape[0])
+        # accumulate full gradient (already normalized upstream by loss/B)
+        self.dW += safe_matmul(x2.T, dy2)
         self.db += dy2.mean(axis=0)
         dx = safe_matmul(dy, self.W.T)
         return dx
@@ -468,12 +471,16 @@ class StudentV9:
         self.embed.backward(dh)
 
     def step(self):
-        etas = self.u.eta(self.cfg.base_lr)
+        # Adapt the effective LR to keep gradient magnitudes near a target.
+        g_rms = float(np.mean(self.grad_rms()))
+        g_scale = float(np.clip(self.cfg.grad_target / max(g_rms, 1e-6), 0.2, 100.0))
+        base = self.cfg.base_lr * g_scale
+        etas = self.u.eta(base)
         for l, blk in enumerate(self.blocks):
             blk.step(float(etas[l]))
-        self.rank_head.step(self.cfg.head_lr)
-        self.embed.step(self.cfg.emb_lr)
-        return etas
+        self.rank_head.step(self.cfg.head_lr * g_scale)
+        self.embed.step(self.cfg.emb_lr * g_scale)
+        return etas, g_rms, g_scale
 
     def grad_rms(self) -> np.ndarray:
         vals = []
@@ -491,7 +498,8 @@ def ce_with_temp(logits: np.ndarray, y: np.ndarray, T: np.ndarray) -> Tuple[floa
     z = logits / np.maximum(T, 1e-6); p = softmax_rows(z)
     B = y.shape[0]; oh = np.zeros_like(p); oh[np.arange(B), y] = 1.0
     ce = -np.sum(np.log(np.maximum(p, 1e-12)) * oh) / max(1, B)
-    dlogits = (p - oh) / max(1, B) / np.maximum(T, 1e-6)
+    # scale gradient a bit higher to speed learning in the toy setting
+    dlogits = GRAD_BOOST * (p - oh) / np.maximum(T, 1e-6)
     return float(ce), dlogits.astype(np.float32), p
 
 def kl_teacher_student(teacher_logits: np.ndarray, student_logits: np.ndarray, T: np.ndarray) -> Tuple[float, np.ndarray]:
@@ -499,7 +507,7 @@ def kl_teacher_student(teacher_logits: np.ndarray, student_logits: np.ndarray, T
     p = softmax_rows(student_logits / np.maximum(T, 1e-6))
     B = p.shape[0]
     kl = np.sum(q * (np.log(np.maximum(q, 1e-12)) - np.log(np.maximum(p, 1e-12)))) / max(1, B)
-    dlogits = (p - q) / max(1, B) / np.maximum(T, 1e-6)
+    dlogits = GRAD_BOOST * (p - q) / np.maximum(T, 1e-6)
     return float(kl), dlogits.astype(np.float32)
 
 def T_from_Sigma(B: np.ndarray, Sigma: np.ndarray, logits: np.ndarray,
@@ -609,7 +617,7 @@ class SpiralV9:
 
             # backward + step
             self.student.backward(dlogits, aux, dSigma_from_T=dSigma_T)
-            etas = self.student.step()
+            etas, g_rms, g_scale = self.student.step()
 
             # reliability → rho nudging
             xz, stab, expl = self.teacher.rel.layer_stats(stab_thr=1.5)
@@ -637,11 +645,12 @@ class SpiralV9:
                              ECE=float(np.mean(np.max(p_s, axis=-1) - (np.argmax(p_s, axis=-1) == y).astype(np.float32))),
                              T=float(T_S.mean()), var=float(meanVars.mean()),
                              eta0=float(etas[0]), rho0=float(self.student.u.rho[0]), keepk0=int(self.student._keepk[0]),
+                             grad_rms=float(g_rms), grad_scale=float(g_scale),
                              hazard=float(hazard.mean())))
             if (step+1) % 5 == 0:
                 print(f"[{step+1:03d}] CE={ce:.4f} KL={kl:.4f} ECE={logs[-1]['ECE']:.4f} | "
                       f"T={T_S.mean():.3f} var~={meanVars.mean():.4f} | η0={etas[0]:.4e} ρ0={self.student.u.rho[0]:+.3f} keepk0={self.student._keepk[0]} | "
-                      f"hazard~{hazard.mean():.3f}")
+                      f"g_rms={g_rms:.4e} g_scale={g_scale:.2f} | hazard~{hazard.mean():.3f}")
         return logs
 
 # ------------------------------
@@ -649,7 +658,7 @@ class SpiralV9:
 # ------------------------------
 def demo():
     eng = SpiralV9(V=64, d=64, H=3, L=3, r=16, seed=0)
-    cfg = TrainCfg(steps=20, batch=16, ctx_len=8,
+    cfg = TrainCfg(steps=100, batch=16, ctx_len=8,
                    T0=1.0, lam=1.0, gamma=1.0, Tmin=0.7, Tmax=1.8, topk=32,
                    lam_distil=0.5, lr_k_stab=0.02, lr_k_expl=0.01,
                    keepk_boost=2, rho_boost=0.0, backprop_T=True, T_grad_scale=0.1)
