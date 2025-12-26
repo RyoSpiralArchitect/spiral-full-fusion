@@ -654,7 +654,7 @@ def demo():
                    lam_distil=0.5, lr_k_stab=0.02, lr_k_expl=0.01,
                    keepk_boost=2, rho_boost=0.0, backprop_T=True, T_grad_scale=0.1)
     logs = eng.train(cfg)
-    print("== SpiralFullFusion V9 (compact) Demo — DONE ==")
+    print("== SpiralFullFusion (compact) Demo — DONE ==")
     return logs
 
 if __name__ == "__main__":
