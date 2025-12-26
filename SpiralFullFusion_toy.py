@@ -17,7 +17,7 @@ def softmax_rows(Z: np.ndarray) -> np.ndarray:
     S = E / np.maximum(E.sum(axis=-1, keepdims=True), EPS)
     return S.astype(np.float32)
 
-GRAD_BOOST = 20.0  # amplify toy gradients so the student actually moves
+GRAD_BOOST = 25.0  # amplify toy gradients so the student actually moves
 
 def silu(x: np.ndarray) -> np.ndarray:
     return (x / (1.0 + np.exp(-np.clip(x, -20.0, 20.0)))).astype(np.float32)
