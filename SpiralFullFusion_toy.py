@@ -154,7 +154,7 @@ class BayesHeadFuseLR:
         return safe_matmul(var_r[None, :], B2)[0]  # [V]
 
 class ReliabilityTracker:
-    def __init__(self, L: int, H: int, ema: float = 0.9):
+    def __init__(self, L: int, H: int, ema: float = 0.7):
         self.L, self.H = L, H; self.ema = float(ema)
         self.x = np.zeros((L, H), dtype=np.float32)  # dominance
         self.y = np.zeros((L, H), dtype=np.float32)  # reliability (precision)
@@ -192,7 +192,7 @@ class SpiralTeacher:
         B0 = self.fusers[0].B
         for f in self.fusers[1:]: f.B = B0
         self.B = B0
-        self.rel = ReliabilityTracker(L, H, ema=0.9)
+        self.rel = ReliabilityTracker(L, H, ema=0.7)
         # rag source weights (per vocab id) for SHAP attenuation
         self.rag_src_weight = np.ones((V,), dtype=np.float32)
 
@@ -250,7 +250,7 @@ class SpiralTeacher:
             logits_b = self.fusers[-1].logits_from_mu(mu_post)
 
             # RAG delta on logits (bCSR)
-            delta = rag_bcsr_bigram(tokens_batch[b][None, :], self.V, self.P, m=3, w=0.6)
+            delta = rag_bcsr_bigram(tokens_batch[b][None, :], self.V, self.P, m=8, w=1.5)
             tag, indptr, indices, data = delta
             s, e = int(indptr[0]), int(indptr[1])
             inds = indices[s:e]; vals = data[s:e]
@@ -281,16 +281,14 @@ class SpiralTeacher:
             logits[b] = logits_b; Ts[b, 0] = T; meanVars[b] = mean_var
 
         # layer hazard & keep-k suggestion from reliability
-        xz, stab, expl = self.rel.layer_stats(stab_thr=1.5)
+        xz, stab, expl = self.rel.layer_stats(stab_thr=1.0)
         for l in range(self.L):
             expl_frac = float(np.mean(expl[l]))
             stab_frac = float(np.mean(stab[l]))
-            dom_z = float(np.mean(xz[l]))
-            # hazard rises when explorers dominate and dominance is high; smoothed via sigmoid
-            raw = (expl_frac - stab_frac) + 0.2 * dom_z
             rel_level = float(np.mean(self.rel.y[l]))
-            conf = 1.0 / (1.0 + np.exp(-rel_level + 0.5))  # confidence from reliability
-            rho_layer = conf * (1.0 / (1.0 + np.exp(-3.0 * raw)))
+            dom_std = float(np.std(self.rel.x[l]))
+            raw = 0.3 * (expl_frac - stab_frac) + 0.3 * dom_std + 0.4 * np.tanh(rel_level)
+            rho_layer = float(np.clip(raw, 0.0, 1.0))
             layer_hazard[l] = rho_layer
             keepk_suggest[l] = int(np.clip( (1.0 + rho_layer) * (self.fusers[0].r // 2), 2, self.fusers[0].r))
 
@@ -558,7 +556,8 @@ def dCEdT(logits: np.ndarray, y: np.ndarray, T: np.ndarray) -> np.ndarray:
 
 def dTdSigma(B: np.ndarray, logits: np.ndarray, Sigma: np.ndarray,
              T: np.ndarray, meanVar: np.ndarray, var_top: np.ndarray,
-             T0: float = 1.0, lam: float = 1.0, gamma: float = 1.0, k: int = 40) -> np.ndarray:
+             T0: float = 1.0, lam: float = 1.0, gamma: float = 1.0, k: int = 40,
+             Tmin: float = 0.7, Tmax: float = 1.8) -> np.ndarray:
     # ∂T/∂Σ_r = T0 * γ * λ * (1+λ m)^{γ-1} * (1/k) * sum_{j∈topk} B_{rj}^2
     B2 = (B * B)  # [r,V]
     k_eff = var_top.shape[1]
@@ -568,11 +567,12 @@ def dTdSigma(B: np.ndarray, logits: np.ndarray, Sigma: np.ndarray,
     avg_B2 = np.zeros((Bn, r), dtype=np.float32)
     for b in range(Bn):
         avg_B2[b] = B2[:, idx[b]].mean(axis=1)  # [r]
+    rawT = (T0 * np.power(1.0 + lam * meanVar[:, None], gamma)).astype(np.float32)
     factor = (T0 * gamma * lam * np.power(1.0 + lam * meanVar[:, None], max(0.0, gamma - 1.0))).astype(np.float32)
-    # if clamped at bounds, stop gradient
-    clamp_mask = ((T <= (T0 * (1.0 + lam * meanVar[:, None])**gamma) - 1e-6) &
-                  (T >= (T0 * (1.0 + lam * meanVar[:, None])**gamma) + 1e-6))
     dT_dSigma = (factor / max(1, k_eff)) * avg_B2  # [B,r]
+    clamped = (rawT <= (Tmin + 1e-6)) | (rawT >= (Tmax - 1e-6))
+    if clamped.any():
+        dT_dSigma[clamped[:, 0]] = 0.0
     return dT_dSigma.astype(np.float32)
 
 # ------------------------------
@@ -614,6 +614,7 @@ class SpiralV9:
                 ctx, y = sample_batch_bigram(self.P, ctx_len=cfg.ctx_len, B=Bn, rng=rng)
             else:
                 ctx, y = sample_batch_from_array(data_tokens, ctx_len=cfg.ctx_len, B=Bn, rng=rng, V=self.V)
+            embed_prev = self.student.embed.W.copy()
 
             # teacher
             t_logits, Ts, meanVars, meta = self.teacher.forward_batch(ctx)
@@ -636,15 +637,18 @@ class SpiralV9:
             if cfg.backprop_T:
                 dC = dCEdT(s_logits, y, T_S)                    # [B,1]
                 dTdS = dTdSigma(self.student.B, s_logits, aux["Sigma"], T_S, meanVar_S, var_top_S,
-                                 T0=cfg.T0, lam=cfg.lam, gamma=cfg.gamma, k=cfg.topk)  # [B,r]
+                                 T0=cfg.T0, lam=cfg.lam, gamma=cfg.gamma, k=cfg.topk,
+                                 Tmin=cfg.Tmin, Tmax=cfg.Tmax)  # [B,r]
                 dSigma_T = (cfg.T_grad_scale * dC) * dTdS       # [B,r]
 
             # backward + step
             self.student.backward(dlogits, aux, dSigma_from_T=dSigma_T)
+            embed_gnorm = float(np.linalg.norm(self.student.embed.dW))
             etas, g_rms, g_scale = self.student.step()
+            embed_delta = float(np.linalg.norm(self.student.embed.W - embed_prev))
 
             # reliability → rho nudging
-            xz, stab, expl = self.teacher.rel.layer_stats(stab_thr=1.5)
+            xz, stab, expl = self.teacher.rel.layer_stats(stab_thr=1.0)
             for l in range(self.student.cfg.L):
                 # map L mismatch (teacher L vs student L): clamp index
                 l_t = min(l, self.teacher.L - 1)
@@ -653,7 +657,11 @@ class SpiralV9:
                 self.student.u.rho[l] = float(np.clip(self.student.u.rho[l], -2.0, 2.0))
 
             # partial optimization (hazard)
-            hazard = meta["layer_hazard"]  # [L_teach]
+            hazard = meta["layer_hazard"].copy()  # [L_teach]
+            grad_layers = self.student.grad_rms()
+            for l_t in range(self.teacher.L):
+                idx = min(l_t, grad_layers.shape[0]-1)
+                hazard[l_t] = float(np.clip(grad_layers[idx] / 0.2, 0.0, 1.0))
             keepk_new = self.student._keepk.copy()
             for l in range(self.student.cfg.L):
                 l_t = min(l, self.teacher.L - 1)
@@ -673,12 +681,15 @@ class SpiralV9:
                              eta0=float(etas[0]), rho0=float(self.student.u.rho[0]), keepk0=int(self.student._keepk[0]),
                              grad_rms=float(g_rms), grad_scale=float(g_scale),
                              keepk_all=self.student._keepk.tolist(), rho_all=self.student.u.rho.tolist(),
-                             hazard=float(hazard.mean()), **rag_stats))
+                             hazard=float(hazard.mean()), hazard_all=meta["layer_hazard"].tolist(),
+                             embed_dnorm=embed_delta, embed_gnorm=embed_gnorm,
+                             **rag_stats))
             if (step+1) % 5 == 0:
                 print(f"[{step+1:03d}] CE={ce:.4f} KL={kl:.4f} ECE={logs[-1]['ECE']:.4f} | "
                       f"T={T_S.mean():.3f} var~={meanVars.mean():.4f} | η0={etas[0]:.4e} ρ0={self.student.u.rho[0]:+.3f} keepk0={self.student._keepk[0]} | "
                       f"g_rms={g_rms:.4e} g_scale={g_scale:.2f} | hazard~{hazard.mean():.3f} | "
                       f"keepk={self.student._keepk.tolist()} rho={self.student.u.rho.tolist()} "
+                      f"hazards={meta['layer_hazard'].tolist()} embed_dnorm={embed_delta:.4e} embed_gnorm={embed_gnorm:.4e} | "
                       f"rag_w[min/mean/max]={rag_stats['rag_min']:.3f}/{rag_stats['rag_mean']:.3f}/{rag_stats['rag_max']:.3f}")
         return logs
 
@@ -688,7 +699,7 @@ class SpiralV9:
 def demo(args=None):
     import argparse
     p = argparse.ArgumentParser(description="SpiralFullFusion toy demo")
-    p.add_argument("--steps", type=int, default=100)
+    p.add_argument("--steps", type=int, default=500)
     p.add_argument("--batch", type=int, default=16)
     p.add_argument("--ctx_len", type=int, default=8)
     p.add_argument("--V", type=int, default=64)
