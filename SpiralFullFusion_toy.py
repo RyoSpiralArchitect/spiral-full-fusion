@@ -24,7 +24,10 @@ def safe_tanh(x: np.ndarray) -> np.ndarray:
     return np.tanh(np.clip(x, -10.0, 10.0)).astype(np.float32)
 
 def safe_matmul(a: np.ndarray, b: np.ndarray) -> np.ndarray:
-    y = a @ b
+    a_clean = np.nan_to_num(a, nan=0.0, posinf=1e3, neginf=-1e3).astype(np.float32)
+    b_clean = np.nan_to_num(b, nan=0.0, posinf=1e3, neginf=-1e3).astype(np.float32)
+    with np.errstate(invalid='ignore', over='ignore', divide='ignore'):
+        y = a_clean @ b_clean
     y = np.nan_to_num(y, nan=0.0, posinf=1e6, neginf=-1e6).astype(np.float32)
     return y
 
@@ -261,7 +264,10 @@ class SpiralTeacher:
         # layer hazard & keep-k suggestion from reliability
         xz, stab, expl = self.rel.layer_stats(stab_thr=1.5)
         for l in range(self.L):
-            rho_layer = float(np.mean(expl[l]) / (np.mean(stab[l]) + 1e-6))  # more explorers ⇒ higher hazard
+            expl_frac = float(np.mean(expl[l]))
+            stab_frac = float(np.mean(stab[l]))
+            total = max(expl_frac + stab_frac, 1e-6)
+            rho_layer = expl_frac / total  # normalized explorer ratio in [0,1]
             layer_hazard[l] = rho_layer
             keepk_suggest[l] = int(np.clip( (1.0 + rho_layer) * (self.fusers[0].r // 2), 2, self.fusers[0].r))
 
