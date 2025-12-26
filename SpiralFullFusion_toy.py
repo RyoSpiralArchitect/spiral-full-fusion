@@ -78,7 +78,7 @@ def sample_batch_from_array(data: np.ndarray, ctx_len: int, B: int, rng: np.rand
     y = np.clip(y, 0, V - 1)
     return ctx, y
 
-def rag_bcsr_bigram(tokens_batch: np.ndarray, vocab_size: int, P: np.ndarray, m: int = 3, w: float = 0.6):
+def rag_bcsr_bigram(tokens_batch: np.ndarray, vocab_size: int, P: np.ndarray, m: int = 8, w: float = 1.5):
     B = tokens_batch.shape[0]
     indices_list = []; data_list = []; indptr = [0]
     for b in range(B):
@@ -437,8 +437,8 @@ class UncertaintyLR:
 @dataclass
 class StudentCfg:
     L: int = 4; d: int = 64; k: int = 16; V: int = 64; r: int = 16
-    base_lr: float = 1e-2; head_lr: float = 1e-2; emb_lr: float = 1e-2
-    grad_target: float = 0.15
+    base_lr: float = 5e-2; head_lr: float = 5e-2; emb_lr: float = 5e-2
+    grad_target: float = 0.1
     seed: int = 123
 
 class StudentV9:
@@ -585,7 +585,7 @@ class TrainCfg:
     # student T hyper
     T0: float = 1.0; lam: float = 1.0; gamma: float = 1.0; Tmin: float = 0.7; Tmax: float = 1.8; topk: int = 40
     # distillation weight (single membrane for compactness)
-    lam_distil: float = 0.5
+    lam_distil: float = 0.1
     # reliability → rho nudging
     lr_k_stab: float = 0.02; lr_k_expl: float = 0.01
     # hazard → partial optimize
@@ -665,16 +665,21 @@ class SpiralV9:
             self.student.set_keepk_layerwise(keepk_new)
 
             # logging
+            rag_w = self.teacher.rag_src_weight
+            rag_stats = dict(rag_min=float(rag_w.min()), rag_max=float(rag_w.max()), rag_mean=float(rag_w.mean()))
             logs.append(dict(step=step+1, CE=float(ce), KL=float(kl),
                              ECE=float(np.mean(np.max(p_s, axis=-1) - (np.argmax(p_s, axis=-1) == y).astype(np.float32))),
                              T=float(T_S.mean()), var=float(meanVars.mean()),
                              eta0=float(etas[0]), rho0=float(self.student.u.rho[0]), keepk0=int(self.student._keepk[0]),
                              grad_rms=float(g_rms), grad_scale=float(g_scale),
-                             hazard=float(hazard.mean())))
+                             keepk_all=self.student._keepk.tolist(), rho_all=self.student.u.rho.tolist(),
+                             hazard=float(hazard.mean()), **rag_stats))
             if (step+1) % 5 == 0:
                 print(f"[{step+1:03d}] CE={ce:.4f} KL={kl:.4f} ECE={logs[-1]['ECE']:.4f} | "
                       f"T={T_S.mean():.3f} var~={meanVars.mean():.4f} | η0={etas[0]:.4e} ρ0={self.student.u.rho[0]:+.3f} keepk0={self.student._keepk[0]} | "
-                      f"g_rms={g_rms:.4e} g_scale={g_scale:.2f} | hazard~{hazard.mean():.3f}")
+                      f"g_rms={g_rms:.4e} g_scale={g_scale:.2f} | hazard~{hazard.mean():.3f} | "
+                      f"keepk={self.student._keepk.tolist()} rho={self.student.u.rho.tolist()} "
+                      f"rag_w[min/mean/max]={rag_stats['rag_min']:.3f}/{rag_stats['rag_mean']:.3f}/{rag_stats['rag_max']:.3f}")
         return logs
 
 # ------------------------------
@@ -701,7 +706,7 @@ def demo(args=None):
     eng = SpiralV9(V=parsed.V, d=parsed.d, H=parsed.H, L=parsed.L, r=parsed.r, seed=0)
     cfg = TrainCfg(steps=parsed.steps, batch=parsed.batch, ctx_len=parsed.ctx_len,
                    T0=1.0, lam=1.0, gamma=1.0, Tmin=0.7, Tmax=1.8, topk=32,
-                   lam_distil=0.5, lr_k_stab=0.02, lr_k_expl=0.01,
+                   lam_distil=0.1, lr_k_stab=0.02, lr_k_expl=0.01,
                    keepk_boost=2, rho_boost=0.0, backprop_T=True, T_grad_scale=0.1,
                    data_path=parsed.data_path)
     logs = eng.train(cfg, data_tokens=data_tokens)
