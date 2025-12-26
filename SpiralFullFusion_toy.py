@@ -17,7 +17,7 @@ def softmax_rows(Z: np.ndarray) -> np.ndarray:
     S = E / np.maximum(E.sum(axis=-1, keepdims=True), EPS)
     return S.astype(np.float32)
 
-GRAD_BOOST = 50.0  # amplify toy gradients so the student actually moves
+GRAD_BOOST = 25.0  # amplify toy gradients so the student actually moves
 
 def silu(x: np.ndarray) -> np.ndarray:
     return (x / (1.0 + np.exp(-np.clip(x, -20.0, 20.0)))).astype(np.float32)
@@ -59,6 +59,23 @@ def sample_batch_bigram(P: np.ndarray, ctx_len: int, B: int, rng: np.random.Gene
         tokens[:, t] = (u[:, None] > cdf).sum(axis=1)
     ctx = tokens[:, :ctx_len].copy()
     y = tokens[:, ctx_len].copy()
+    return ctx, y
+
+def sample_batch_from_array(data: np.ndarray, ctx_len: int, B: int, rng: np.random.Generator, V: int):
+    # data: 1D token ids; wrap if needed
+    N = data.shape[0]
+    if N < ctx_len + 1:
+        raise ValueError("data sequence too short for given ctx_len")
+    ctx = np.zeros((B, ctx_len), dtype=np.int64)
+    y = np.zeros((B,), dtype=np.int64)
+    for b in range(B):
+        start = int(rng.integers(0, N - ctx_len))
+        span = data[start:start+ctx_len+1]
+        ctx[b] = span[:-1]
+        y[b] = span[-1]
+    # clip token ids to vocab
+    ctx = np.clip(ctx, 0, V - 1)
+    y = np.clip(y, 0, V - 1)
     return ctx, y
 
 def rag_bcsr_bigram(tokens_batch: np.ndarray, vocab_size: int, P: np.ndarray, m: int = 3, w: float = 0.6):
@@ -308,7 +325,10 @@ class Linear:
         dx = safe_matmul(dy, self.W.T)
         return dx
     def step(self, lr: float):
-        self.W -= lr * self.dW; self.b -= lr * self.db
+        # clip grads to avoid explosions while keeping movement
+        dWc = np.clip(self.dW, -1.0, 1.0)
+        dbc = np.clip(self.db, -1.0, 1.0)
+        self.W -= lr * dWc; self.b -= lr * dbc
         self.dW.fill(0.0); self.db.fill(0.0)
 
 class Embedding:
@@ -418,7 +438,7 @@ class UncertaintyLR:
 class StudentCfg:
     L: int = 4; d: int = 64; k: int = 16; V: int = 64; r: int = 16
     base_lr: float = 1e-2; head_lr: float = 1e-2; emb_lr: float = 1e-2
-    grad_target: float = 0.25
+    grad_target: float = 0.15
     seed: int = 123
 
 class StudentV9:
@@ -498,6 +518,7 @@ def ce_with_temp(logits: np.ndarray, y: np.ndarray, T: np.ndarray) -> Tuple[floa
     ce = -np.sum(np.log(np.maximum(p, 1e-12)) * oh) / max(1, B)
     # scale gradient a bit higher to speed learning in the toy setting
     dlogits = GRAD_BOOST * (p - oh) / np.maximum(T, 1e-6)
+    dlogits = np.clip(dlogits, -5.0, 5.0)
     return float(ce), dlogits.astype(np.float32), p
 
 def kl_teacher_student(teacher_logits: np.ndarray, student_logits: np.ndarray, T: np.ndarray) -> Tuple[float, np.ndarray]:
@@ -506,6 +527,7 @@ def kl_teacher_student(teacher_logits: np.ndarray, student_logits: np.ndarray, T
     B = p.shape[0]
     kl = np.sum(q * (np.log(np.maximum(q, 1e-12)) - np.log(np.maximum(p, 1e-12)))) / max(1, B)
     dlogits = GRAD_BOOST * (p - q) / np.maximum(T, 1e-6)
+    dlogits = np.clip(dlogits, -5.0, 5.0)
     return float(kl), dlogits.astype(np.float32)
 
 def T_from_Sigma(B: np.ndarray, Sigma: np.ndarray, logits: np.ndarray,
@@ -559,6 +581,7 @@ def dTdSigma(B: np.ndarray, logits: np.ndarray, Sigma: np.ndarray,
 @dataclass
 class TrainCfg:
     steps: int = 30; batch: int = 16; ctx_len: int = 8
+    data_path: Optional[str] = None  # optional npy file of token ids for local data
     # student T hyper
     T0: float = 1.0; lam: float = 1.0; gamma: float = 1.0; Tmin: float = 0.7; Tmax: float = 1.8; topk: int = 40
     # distillation weight (single membrane for compactness)
@@ -577,7 +600,7 @@ class SpiralV9:
         self.teacher = SpiralTeacher(V, d, H, L, r, self.P, TeacherCfg(), seed=42)
         self.student = StudentV9(StudentCfg(L=4, d=d, k=16, V=V, r=r, seed=123), self.teacher.B)
 
-    def train(self, cfg: TrainCfg) -> List[Dict[str, float]]:
+    def train(self, cfg: TrainCfg, data_tokens: Optional[np.ndarray] = None) -> List[Dict[str, float]]:
         rng = np.random.default_rng(0)
         logs = []
         # initial keepk from teacher suggestion
@@ -587,7 +610,10 @@ class SpiralV9:
 
         for step in range(cfg.steps):
             Bn = cfg.batch
-            ctx, y = sample_batch_bigram(self.P, ctx_len=cfg.ctx_len, B=Bn, rng=rng)
+            if data_tokens is None:
+                ctx, y = sample_batch_bigram(self.P, ctx_len=cfg.ctx_len, B=Bn, rng=rng)
+            else:
+                ctx, y = sample_batch_from_array(data_tokens, ctx_len=cfg.ctx_len, B=Bn, rng=rng, V=self.V)
 
             # teacher
             t_logits, Ts, meanVars, meta = self.teacher.forward_batch(ctx)
@@ -665,15 +691,21 @@ def demo(args=None):
     p.add_argument("--H", type=int, default=3)
     p.add_argument("--L", type=int, default=3)
     p.add_argument("--r", type=int, default=16)
+    p.add_argument("--data_path", type=str, default=None, help="optional npy file with token ids")
     parsed = p.parse_args(args=args)
+
+    data_tokens = None
+    if parsed.data_path:
+        data_tokens = np.load(parsed.data_path).astype(np.int64).reshape(-1)
 
     eng = SpiralV9(V=parsed.V, d=parsed.d, H=parsed.H, L=parsed.L, r=parsed.r, seed=0)
     cfg = TrainCfg(steps=parsed.steps, batch=parsed.batch, ctx_len=parsed.ctx_len,
                    T0=1.0, lam=1.0, gamma=1.0, Tmin=0.7, Tmax=1.8, topk=32,
                    lam_distil=0.5, lr_k_stab=0.02, lr_k_expl=0.01,
-                   keepk_boost=2, rho_boost=0.0, backprop_T=True, T_grad_scale=0.1)
-    logs = eng.train(cfg)
-    print("== SpiralFullFusion (compact) Demo — DONE ==")
+                   keepk_boost=2, rho_boost=0.0, backprop_T=True, T_grad_scale=0.1,
+                   data_path=parsed.data_path)
+    logs = eng.train(cfg, data_tokens=data_tokens)
+    print("== SpiralFullFusion V9 (compact) Demo — DONE ==")
     return logs
 
 if __name__ == "__main__":
