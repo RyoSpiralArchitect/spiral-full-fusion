@@ -34,6 +34,175 @@ def safe_matmul(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     return y
 
 # ------------------------------
+# Pure-Python tokenizer (byte-level BPE-ish)
+# ------------------------------
+@dataclass
+class TokenizerCfg:
+    vocab_size: int = 512      # desired vocabulary size (will be clamped to >= 260)
+    min_freq: int = 2          # minimum pair frequency to merge
+    add_bos: bool = True
+    add_eos: bool = True
+    lowercase: bool = False
+
+
+class SpiralTokenizer:
+    """
+    Compact byte-level tokenizer with BPE-style merges.
+    No external dependencies; suitable for quick CLI demos when only a text path is available.
+    """
+
+    def __init__(self, cfg: TokenizerCfg):
+        self.cfg = cfg
+        self.special_tokens = ["<unk>", "<pad>", "<bos>", "<eos>"]
+        self.unk_id, self.pad_id, self.bos_id, self.eos_id = range(4)
+        self.byte_offset = len(self.special_tokens)
+        # vocab bookkeeping
+        self.token_to_id: Dict[str, int] = {}
+        self.id_to_token: List[str] = []
+        self.id_to_bytes: List[Optional[bytes]] = []
+        self.merge_ranks: Dict[Tuple[int, int], int] = {}  # pair -> rank (lower is earlier/better)
+        self.merge_to_id: Dict[Tuple[int, int], int] = {}  # pair -> new token id
+        self._init_base_vocab()
+
+    # ------------------ training helpers ------------------
+    def _init_base_vocab(self):
+        for tok in self.special_tokens:
+            self._register_token(tok, None)
+        for b in range(256):
+            tok = f"<0x{b:02x}>"
+            self._register_token(tok, bytes([b]))
+
+    def _register_token(self, tok: str, piece: Optional[bytes]):
+        self.token_to_id[tok] = len(self.token_to_id)
+        self.id_to_token.append(tok)
+        self.id_to_bytes.append(piece)
+
+    def _piece(self, token_id: int) -> Optional[bytes]:
+        if 0 <= token_id < len(self.id_to_bytes):
+            return self.id_to_bytes[token_id]
+        return None
+
+    def _count_pairs(self, sequences: List[List[int]]) -> Dict[Tuple[int, int], int]:
+        counts: Dict[Tuple[int, int], int] = {}
+        for seq in sequences:
+            for a, b in zip(seq, seq[1:]):
+                if a < self.byte_offset or b < self.byte_offset:
+                    # do not merge specials; keep structure
+                    continue
+                counts[(a, b)] = counts.get((a, b), 0) + 1
+        return counts
+
+    def _merge_sequences(self, sequences: List[List[int]], pair: Tuple[int, int], new_id: int) -> List[List[int]]:
+        a, b = pair
+        merged: List[List[int]] = []
+        for seq in sequences:
+            i = 0; out = []
+            while i < len(seq):
+                if i < len(seq) - 1 and seq[i] == a and seq[i + 1] == b:
+                    out.append(new_id); i += 2
+                else:
+                    out.append(seq[i]); i += 1
+            merged.append(out)
+        return merged
+
+    def _merge_bytes(self, pair: Tuple[int, int]) -> bytes:
+        a, b = pair
+        pa = self._piece(a) or b""
+        pb = self._piece(b) or b""
+        return pa + pb
+
+    def _format_piece(self, piece: bytes) -> str:
+        # make piece human-readable for logging/debugging
+        printable = ''.join(chr(c) if 32 <= c < 127 else '.' for c in piece)
+        return f"<{len(piece)}:{printable}>"
+
+    def train_from_text(self, text: str):
+        if self.cfg.lowercase:
+            text = text.lower()
+        # initialize corpus as byte tokens per line to retain some locality
+        sequences: List[List[int]] = []
+        for line in text.splitlines():
+            raw_bytes = line.encode("utf-8")
+            seq = [self.byte_offset + b for b in raw_bytes]
+            if self.cfg.add_bos: seq = [self.bos_id] + seq
+            if self.cfg.add_eos: seq = seq + [self.eos_id]
+            if len(seq) > 0:
+                sequences.append(seq)
+
+        target_vocab = max(self.cfg.vocab_size, self.byte_offset + 256)
+        while len(self.id_to_token) < target_vocab:
+            pair_counts = self._count_pairs(sequences)
+            if not pair_counts:
+                break
+            (best_a, best_b), freq = max(pair_counts.items(), key=lambda kv: kv[1])
+            if freq < self.cfg.min_freq:
+                break
+            new_piece = self._merge_bytes((best_a, best_b))
+            new_token = self._format_piece(new_piece)
+            new_id = len(self.id_to_token)
+            self._register_token(new_token, new_piece)
+            pair = (best_a, best_b)
+            self.merge_ranks[pair] = len(self.merge_ranks)
+            self.merge_to_id[pair] = new_id
+            sequences = self._merge_sequences(sequences, (best_a, best_b), new_id)
+
+    # ------------------ encoding/decoding ------------------
+    def _bpe(self, ids: List[int]) -> List[int]:
+        # standard greedy BPE merge loop using merge ranks
+        if not self.merge_ranks:
+            return ids
+        while True:
+            candidates = []
+            for i in range(len(ids) - 1):
+                pair = (ids[i], ids[i + 1])
+                rank = self.merge_ranks.get(pair, None)
+                if rank is not None:
+                    candidates.append((rank, i, pair))
+            pairs = candidates
+            if not pairs:
+                break
+            _, pos, pair = min(pairs, key=lambda x: x[0])
+            new_id = self.merge_to_id[pair]
+            ids = ids[:pos] + [new_id] + ids[pos + 2:]
+        return ids
+
+    def encode(self, text: str, add_special_tokens: bool = True) -> np.ndarray:
+        if self.cfg.lowercase:
+            text = text.lower()
+        byte_ids = [self.byte_offset + b for b in text.encode("utf-8")]
+        ids = byte_ids
+        ids = self._bpe(ids)
+        if add_special_tokens and self.cfg.add_bos:
+            ids = [self.bos_id] + ids
+        if add_special_tokens and self.cfg.add_eos:
+            ids = ids + [self.eos_id]
+        # clamp to known vocab
+        ids = [tid if tid < len(self.id_to_token) else self.unk_id for tid in ids]
+        return np.array(ids, dtype=np.int64)
+
+    def encode_corpus(self, text: str) -> np.ndarray:
+        all_ids: List[np.ndarray] = []
+        for line in text.splitlines():
+            all_ids.append(self.encode(line, add_special_tokens=True))
+        if not all_ids:
+            return np.zeros((0,), dtype=np.int64)
+        return np.concatenate(all_ids)
+
+    def decode(self, ids: np.ndarray) -> str:
+        pieces: List[bytes] = []
+        for tid in ids.tolist():
+            if tid in (self.bos_id, self.eos_id, self.pad_id):
+                continue
+            piece = self._piece(tid)
+            if piece is not None:
+                pieces.append(piece)
+        return b"".join(pieces).decode("utf-8", errors="ignore")
+
+    @property
+    def vocab_size(self) -> int:
+        return len(self.id_to_token)
+
+# ------------------------------
 # toy bigram data + RAG bCSR scorer
 # ------------------------------
 def make_bigram(V: int, seed: int = 0, latent: int = 8) -> np.ndarray:
@@ -708,13 +877,32 @@ def demo(args=None):
     p.add_argument("--L", type=int, default=3)
     p.add_argument("--r", type=int, default=16)
     p.add_argument("--data_path", type=str, default=None, help="optional npy file with token ids")
+    p.add_argument("--text_path", type=str, default=None, help="optional utf-8 text file to train tokenizer + dataset")
+    p.add_argument("--tok_vocab", type=int, default=512, help="tokenizer vocab size target when using text_path")
+    p.add_argument("--tok_min_freq", type=int, default=2, help="minimum pair frequency for BPE merges")
+    p.add_argument("--tok_lowercase", action="store_true", help="lowercase text before tokenization")
+    p.add_argument("--tok_no_bos", action="store_true", help="disable adding BOS during tokenization")
+    p.add_argument("--tok_no_eos", action="store_true", help="disable adding EOS during tokenization")
     parsed = p.parse_args(args=args)
 
     data_tokens = None
+    vocab_override = parsed.V
     if parsed.data_path:
         data_tokens = np.load(parsed.data_path).astype(np.int64).reshape(-1)
+        data_tokens = np.clip(data_tokens, 0, parsed.V - 1)
+    if parsed.text_path and data_tokens is None:
+        with open(parsed.text_path, "r", encoding="utf-8") as f:
+            text = f.read()
+        tok_cfg = TokenizerCfg(vocab_size=parsed.tok_vocab, min_freq=parsed.tok_min_freq,
+                               add_bos=not parsed.tok_no_bos, add_eos=not parsed.tok_no_eos,
+                               lowercase=parsed.tok_lowercase)
+        tokenizer = SpiralTokenizer(tok_cfg)
+        tokenizer.train_from_text(text)
+        data_tokens = tokenizer.encode_corpus(text)
+        vocab_override = max(vocab_override, tokenizer.vocab_size)
+        data_tokens = np.clip(data_tokens, 0, vocab_override - 1)
 
-    eng = SpiralV9(V=parsed.V, d=parsed.d, H=parsed.H, L=parsed.L, r=parsed.r, seed=0)
+    eng = SpiralV9(V=vocab_override, d=parsed.d, H=parsed.H, L=parsed.L, r=parsed.r, seed=0)
     cfg = TrainCfg(steps=parsed.steps, batch=parsed.batch, ctx_len=parsed.ctx_len,
                    T0=1.0, lam=1.0, gamma=1.0, Tmin=0.7, Tmax=1.8, topk=32,
                    lam_distil=0.1, lr_k_stab=0.02, lr_k_expl=0.01,
