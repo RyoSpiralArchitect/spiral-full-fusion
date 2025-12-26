@@ -420,7 +420,12 @@ class StudentV9:
         self._keepk = np.full((cfg.L,), max(2, cfg.k // 2), dtype=np.int32)
 
     def set_keepk_layerwise(self, keepk: np.ndarray):
-        self._keepk = keepk.astype(np.int32).copy()
+        # Accept keepk arrays shorter/longer than student depth and broadcast safely.
+        kk = np.clip(keepk.astype(np.int32), 2, self.cfg.k)
+        if kk.size < self.cfg.L:
+            pad_val = kk[-1] if kk.size > 0 else max(2, self.cfg.k // 2)
+            kk = np.concatenate([kk, np.full((self.cfg.L - kk.size,), pad_val, dtype=np.int32)])
+        self._keepk = kk[: self.cfg.L].copy()
 
     def forward(self, tokens: np.ndarray) -> Tuple[np.ndarray, Dict[str, Any]]:
         x = self.embed.forward(tokens)  # [B,T,d]
