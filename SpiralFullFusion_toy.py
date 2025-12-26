@@ -17,6 +17,8 @@ def softmax_rows(Z: np.ndarray) -> np.ndarray:
     S = E / np.maximum(E.sum(axis=-1, keepdims=True), EPS)
     return S.astype(np.float32)
 
+GRAD_BOOST = 5.0  # amplify toy gradients so the student actually moves
+
 def silu(x: np.ndarray) -> np.ndarray:
     return (x / (1.0 + np.exp(-np.clip(x, -20.0, 20.0)))).astype(np.float32)
 
@@ -24,7 +26,10 @@ def safe_tanh(x: np.ndarray) -> np.ndarray:
     return np.tanh(np.clip(x, -10.0, 10.0)).astype(np.float32)
 
 def safe_matmul(a: np.ndarray, b: np.ndarray) -> np.ndarray:
-    y = a @ b
+    a_clean = np.nan_to_num(a, nan=0.0, posinf=1e3, neginf=-1e3).astype(np.float32)
+    b_clean = np.nan_to_num(b, nan=0.0, posinf=1e3, neginf=-1e3).astype(np.float32)
+    with np.errstate(invalid='ignore', over='ignore', divide='ignore'):
+        y = a_clean @ b_clean
     y = np.nan_to_num(y, nan=0.0, posinf=1e6, neginf=-1e6).astype(np.float32)
     return y
 
@@ -158,7 +163,7 @@ class ReliabilityTracker:
 class TeacherCfg:
     T0: float = 1.0; lam: float = 1.0; gamma: float = 1.0; Tmin: float = 0.7; Tmax: float = 1.8
     topk: int = 40
-    danger_rho_thr: float = 0.6
+    danger_rho_thr: float = 0.8
 
 class SpiralTeacher:
     def __init__(self, V: int, d: int, H: int, L: int, r: int, P: np.ndarray, cfg: TeacherCfg, seed: int = 0):
@@ -261,7 +266,14 @@ class SpiralTeacher:
         # layer hazard & keep-k suggestion from reliability
         xz, stab, expl = self.rel.layer_stats(stab_thr=1.5)
         for l in range(self.L):
-            rho_layer = float(np.mean(expl[l]) / (np.mean(stab[l]) + 1e-6))  # more explorers ⇒ higher hazard
+            expl_frac = float(np.mean(expl[l]))
+            stab_frac = float(np.mean(stab[l]))
+            dom_z = float(np.mean(xz[l]))
+            # hazard rises when explorers dominate and dominance is high; smoothed via sigmoid
+            raw = (expl_frac - stab_frac) + 0.2 * dom_z
+            rel_level = float(np.mean(self.rel.y[l]))
+            conf = 1.0 / (1.0 + np.exp(-rel_level + 0.5))  # confidence from reliability
+            rho_layer = conf * (1.0 / (1.0 + np.exp(-3.0 * raw)))
             layer_hazard[l] = rho_layer
             keepk_suggest[l] = int(np.clip( (1.0 + rho_layer) * (self.fusers[0].r // 2), 2, self.fusers[0].r))
 
@@ -290,7 +302,8 @@ class Linear:
     def backward(self, dy: np.ndarray) -> np.ndarray:
         x = self._x
         x2 = x.reshape(-1, x.shape[-1]); dy2 = dy.reshape(-1, dy.shape[-1])
-        self.dW += safe_matmul(x2.T, dy2) / max(1, x2.shape[0])
+        # accumulate full gradient (already normalized upstream by loss/B)
+        self.dW += safe_matmul(x2.T, dy2)
         self.db += dy2.mean(axis=0)
         dx = safe_matmul(dy, self.W.T)
         return dx
@@ -404,7 +417,7 @@ class UncertaintyLR:
 @dataclass
 class StudentCfg:
     L: int = 4; d: int = 64; k: int = 16; V: int = 64; r: int = 16
-    base_lr: float = 3e-3; head_lr: float = 3e-3; emb_lr: float = 3e-3
+    base_lr: float = 1e-2; head_lr: float = 1e-2; emb_lr: float = 1e-2
     grad_target: float = 0.02
     seed: int = 123
 
@@ -420,7 +433,12 @@ class StudentV9:
         self._keepk = np.full((cfg.L,), max(2, cfg.k // 2), dtype=np.int32)
 
     def set_keepk_layerwise(self, keepk: np.ndarray):
-        self._keepk = keepk.astype(np.int32).copy()
+        # Accept keepk arrays shorter/longer than student depth and broadcast safely.
+        kk = np.clip(keepk.astype(np.int32), 2, self.cfg.k)
+        if kk.size < self.cfg.L:
+            pad_val = kk[-1] if kk.size > 0 else max(2, self.cfg.k // 2)
+            kk = np.concatenate([kk, np.full((self.cfg.L - kk.size,), pad_val, dtype=np.int32)])
+        self._keepk = kk[: self.cfg.L].copy()
 
     def forward(self, tokens: np.ndarray) -> Tuple[np.ndarray, Dict[str, Any]]:
         x = self.embed.forward(tokens)  # [B,T,d]
@@ -451,12 +469,16 @@ class StudentV9:
         self.embed.backward(dh)
 
     def step(self):
-        etas = self.u.eta(self.cfg.base_lr)
+        # Adapt the effective LR to keep gradient magnitudes near a target.
+        g_rms = float(np.mean(self.grad_rms()))
+        g_scale = float(np.clip(self.cfg.grad_target / max(g_rms, 1e-6), 0.2, 10.0))
+        base = self.cfg.base_lr * g_scale
+        etas = self.u.eta(base)
         for l, blk in enumerate(self.blocks):
             blk.step(float(etas[l]))
-        self.rank_head.step(self.cfg.head_lr)
-        self.embed.step(self.cfg.emb_lr)
-        return etas
+        self.rank_head.step(self.cfg.head_lr * g_scale)
+        self.embed.step(self.cfg.emb_lr * g_scale)
+        return etas, g_rms, g_scale
 
     def grad_rms(self) -> np.ndarray:
         vals = []
@@ -474,7 +496,8 @@ def ce_with_temp(logits: np.ndarray, y: np.ndarray, T: np.ndarray) -> Tuple[floa
     z = logits / np.maximum(T, 1e-6); p = softmax_rows(z)
     B = y.shape[0]; oh = np.zeros_like(p); oh[np.arange(B), y] = 1.0
     ce = -np.sum(np.log(np.maximum(p, 1e-12)) * oh) / max(1, B)
-    dlogits = (p - oh) / max(1, B) / np.maximum(T, 1e-6)
+    # scale gradient a bit higher to speed learning in the toy setting
+    dlogits = GRAD_BOOST * (p - oh) / np.maximum(T, 1e-6)
     return float(ce), dlogits.astype(np.float32), p
 
 def kl_teacher_student(teacher_logits: np.ndarray, student_logits: np.ndarray, T: np.ndarray) -> Tuple[float, np.ndarray]:
@@ -482,7 +505,7 @@ def kl_teacher_student(teacher_logits: np.ndarray, student_logits: np.ndarray, T
     p = softmax_rows(student_logits / np.maximum(T, 1e-6))
     B = p.shape[0]
     kl = np.sum(q * (np.log(np.maximum(q, 1e-12)) - np.log(np.maximum(p, 1e-12)))) / max(1, B)
-    dlogits = (p - q) / max(1, B) / np.maximum(T, 1e-6)
+    dlogits = GRAD_BOOST * (p - q) / np.maximum(T, 1e-6)
     return float(kl), dlogits.astype(np.float32)
 
 def T_from_Sigma(B: np.ndarray, Sigma: np.ndarray, logits: np.ndarray,
@@ -541,9 +564,9 @@ class TrainCfg:
     # distillation weight (single membrane for compactness)
     lam_distil: float = 0.5
     # reliability → rho nudging
-    lr_k_stab: float = 0.02; lr_k_expl: float = 0.03
+    lr_k_stab: float = 0.02; lr_k_expl: float = 0.01
     # hazard → partial optimize
-    keepk_boost: int = 4; rho_boost: float = 0.5
+    keepk_boost: int = 2; rho_boost: float = 0.0
     # T backprop switch & scale
     backprop_T: bool = True; T_grad_scale: float = 0.1
 
@@ -592,7 +615,7 @@ class SpiralV9:
 
             # backward + step
             self.student.backward(dlogits, aux, dSigma_from_T=dSigma_T)
-            etas = self.student.step()
+            etas, g_rms, g_scale = self.student.step()
 
             # reliability → rho nudging
             xz, stab, expl = self.teacher.rel.layer_stats(stab_thr=1.5)
@@ -611,6 +634,8 @@ class SpiralV9:
                 if hazard[l_t] > self.teacher.cfg.danger_rho_thr:
                     keepk_new[l] = int(np.clip(keepk_new[l] + cfg.keepk_boost, 2, self.student.cfg.k))
                     self.student.u.rho[l] += cfg.rho_boost  # reduce LR
+            # re-clamp after hazard nudging to prevent runaway shrinkage of learning rate
+            self.student.u.rho = np.clip(self.student.u.rho, -2.0, 2.0)
             self.student.set_keepk_layerwise(keepk_new)
 
             # logging
@@ -618,22 +643,35 @@ class SpiralV9:
                              ECE=float(np.mean(np.max(p_s, axis=-1) - (np.argmax(p_s, axis=-1) == y).astype(np.float32))),
                              T=float(T_S.mean()), var=float(meanVars.mean()),
                              eta0=float(etas[0]), rho0=float(self.student.u.rho[0]), keepk0=int(self.student._keepk[0]),
+                             grad_rms=float(g_rms), grad_scale=float(g_scale),
                              hazard=float(hazard.mean())))
             if (step+1) % 5 == 0:
                 print(f"[{step+1:03d}] CE={ce:.4f} KL={kl:.4f} ECE={logs[-1]['ECE']:.4f} | "
                       f"T={T_S.mean():.3f} var~={meanVars.mean():.4f} | η0={etas[0]:.4e} ρ0={self.student.u.rho[0]:+.3f} keepk0={self.student._keepk[0]} | "
-                      f"hazard~{hazard.mean():.3f}")
+                      f"g_rms={g_rms:.4e} g_scale={g_scale:.2f} | hazard~{hazard.mean():.3f}")
         return logs
 
 # ------------------------------
-# Demo
+# Demo / CLI
 # ------------------------------
-def demo():
-    eng = SpiralV9(V=64, d=64, H=3, L=3, r=16, seed=0)
-    cfg = TrainCfg(steps=20, batch=16, ctx_len=8,
+def demo(args=None):
+    import argparse
+    p = argparse.ArgumentParser(description="SpiralFullFusion toy demo")
+    p.add_argument("--steps", type=int, default=100)
+    p.add_argument("--batch", type=int, default=16)
+    p.add_argument("--ctx_len", type=int, default=8)
+    p.add_argument("--V", type=int, default=64)
+    p.add_argument("--d", type=int, default=64)
+    p.add_argument("--H", type=int, default=3)
+    p.add_argument("--L", type=int, default=3)
+    p.add_argument("--r", type=int, default=16)
+    parsed = p.parse_args(args=args)
+
+    eng = SpiralV9(V=parsed.V, d=parsed.d, H=parsed.H, L=parsed.L, r=parsed.r, seed=0)
+    cfg = TrainCfg(steps=parsed.steps, batch=parsed.batch, ctx_len=parsed.ctx_len,
                    T0=1.0, lam=1.0, gamma=1.0, Tmin=0.7, Tmax=1.8, topk=32,
-                   lam_distil=0.5, lr_k_stab=0.02, lr_k_expl=0.03,
-                   keepk_boost=4, rho_boost=0.5, backprop_T=True, T_grad_scale=0.1)
+                   lam_distil=0.5, lr_k_stab=0.02, lr_k_expl=0.01,
+                   keepk_boost=2, rho_boost=0.0, backprop_T=True, T_grad_scale=0.1)
     logs = eng.train(cfg)
     print("== SpiralFullFusion V9 (compact) Demo — DONE ==")
     return logs
