@@ -943,7 +943,7 @@ class UncertaintyLR:
 @dataclass
 class StudentCfg:
     L: int = 4; d: int = 96; k: int = 24; V: int = 128; r: int = 64
-    base_lr: float = 5e-2; head_lr: float = 5e-2; emb_lr: float = 5e-2
+    base_lr: float = 1e-1; head_lr: float = 1e-1; emb_lr: float = 1e-1
     grad_target: float = 0.1
     seed: int = 123
 
@@ -956,7 +956,7 @@ class StudentV9:
         self.rank_head = RankParamHead(cfg.d, cfg.r, rng)
         self.B = shared_B.astype(np.float32)  # [r,V]
         self.u = UncertaintyLR(cfg.L, init=0.0)
-        self._keepk = np.full((cfg.L,), max(2, cfg.k // 2), dtype=np.int32)
+        self._keepk = np.full((cfg.L,), max(2, cfg.k), dtype=np.int32)
 
     # ------------------ persistence ------------------
     def _linear_state(self, lin: Linear) -> Dict[str, np.ndarray]:
@@ -1139,7 +1139,7 @@ class TrainCfg:
     # student T hyper
     T0: float = 1.0; lam: float = 1.0; gamma: float = 1.0; Tmin: float = 0.7; Tmax: float = 1.8; topk: int = 40
     # distillation weight (single membrane for compactness)
-    lam_distil: float = 0.1
+    lam_distil: float = 0.7
     distil_warmup: int = 20     # steps before blending in KL
     ce_weight: float = 1.0
     kl_weight: float = 1.0
