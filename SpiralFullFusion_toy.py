@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 # SpiralFullFusion Toy (compact complete) — reliability dynamics + partial optimization + RAG SHAP + T_S(Σ) backprop
 # NumPy-only, single-file demo. Safe initializations and eps clamps to avoid NaNs.
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 from typing import List, Tuple, Optional, Dict, Any
 import numpy as np
 
@@ -257,6 +257,45 @@ class SpiralTokenizer:
     @property
     def vocab_size(self) -> int:
         return len(self.id_to_token)
+
+    # ------------------ persistence helpers ------------------
+    def state_dict(self) -> Dict[str, Any]:
+        return dict(
+            cfg=asdict(self.cfg),
+            special_tokens=self.special_tokens,
+            token_to_id=self.token_to_id,
+            id_to_token=self.id_to_token,
+            id_to_bytes=self.id_to_bytes,
+            merge_ranks=self.merge_ranks,
+            merge_to_id=self.merge_to_id,
+            motif_to_id=self.motif_to_id,
+            motif_lengths=self.motif_lengths,
+        )
+
+    @classmethod
+    def from_state(cls, state: Dict[str, Any]) -> "SpiralTokenizer":
+        cfg = TokenizerCfg(**state["cfg"])
+        tok = cls(cfg)
+        tok.special_tokens = state["special_tokens"]
+        tok.unk_id, tok.pad_id, tok.bos_id, tok.eos_id = range(4)
+        tok.byte_offset = len(tok.special_tokens)
+        tok.token_to_id = state["token_to_id"]
+        tok.id_to_token = state["id_to_token"]
+        tok.id_to_bytes = state["id_to_bytes"]
+        tok.merge_ranks = state["merge_ranks"]
+        tok.merge_to_id = state["merge_to_id"]
+        tok.motif_to_id = state["motif_to_id"]
+        tok.motif_lengths = state["motif_lengths"]
+        return tok
+
+    def save(self, path: str):
+        np.savez_compressed(path, tokenizer_state=np.array([self.state_dict()], dtype=object))
+
+    @classmethod
+    def load(cls, path: str) -> "SpiralTokenizer":
+        data = np.load(path, allow_pickle=True)
+        state = data["tokenizer_state"][0].item()
+        return cls.from_state(state)
 
 # ------------------------------
 # toy bigram data + RAG bCSR scorer
@@ -699,6 +738,47 @@ class StudentV9:
         self.u = UncertaintyLR(cfg.L, init=0.0)
         self._keepk = np.full((cfg.L,), max(2, cfg.k // 2), dtype=np.int32)
 
+    # ------------------ persistence ------------------
+    def _linear_state(self, lin: Linear) -> Dict[str, np.ndarray]:
+        return dict(W=lin.W.copy(), b=lin.b.copy())
+
+    def state_dict(self) -> Dict[str, Any]:
+        blocks = []
+        for blk in self.blocks:
+            blocks.append(dict(
+                attn=dict(q=self._linear_state(blk.attn.q),
+                          k=self._linear_state(blk.attn.k),
+                          v=self._linear_state(blk.attn.v)),
+                ffn=dict(fc1=self._linear_state(blk.ffn.fc1),
+                         fc2=self._linear_state(blk.ffn.fc2)),
+            ))
+        return dict(
+            cfg=asdict(self.cfg),
+            B=self.B.copy(),
+            keepk=self._keepk.copy(),
+            rho=self.u.rho.copy(),
+            embed=dict(W=self.embed.W.copy()),
+            blocks=blocks,
+            rank_head=dict(mean=self._linear_state(self.rank_head.mean),
+                           logtau=self._linear_state(self.rank_head.logtau)),
+        )
+
+    def load_state(self, state: Dict[str, Any]):
+        self.cfg = StudentCfg(**state["cfg"])
+        self.B = state["B"].astype(np.float32)
+        self._keepk = state["keepk"].astype(np.int32)
+        self.u.rho = state["rho"].astype(np.float32)
+        self.embed.W = state["embed"]["W"].astype(np.float32)
+        for blk, sd in zip(self.blocks, state["blocks"]):
+            for lin, ld in zip((blk.attn.q, blk.attn.k, blk.attn.v), (sd["attn"]["q"], sd["attn"]["k"], sd["attn"]["v"])):
+                lin.W = ld["W"].astype(np.float32); lin.b = ld["b"].astype(np.float32)
+            blk.ffn.fc1.W = sd["ffn"]["fc1"]["W"].astype(np.float32); blk.ffn.fc1.b = sd["ffn"]["fc1"]["b"].astype(np.float32)
+            blk.ffn.fc2.W = sd["ffn"]["fc2"]["W"].astype(np.float32); blk.ffn.fc2.b = sd["ffn"]["fc2"]["b"].astype(np.float32)
+        self.rank_head.mean.W = state["rank_head"]["mean"]["W"].astype(np.float32)
+        self.rank_head.mean.b = state["rank_head"]["mean"]["b"].astype(np.float32)
+        self.rank_head.logtau.W = state["rank_head"]["logtau"]["W"].astype(np.float32)
+        self.rank_head.logtau.b = state["rank_head"]["logtau"]["b"].astype(np.float32)
+
     def set_keepk_layerwise(self, keepk: np.ndarray):
         # Accept keepk arrays shorter/longer than student depth and broadcast safely.
         kk = np.clip(keepk.astype(np.int32), 2, self.cfg.k)
@@ -843,12 +923,81 @@ class TrainCfg:
     backprop_T: bool = True; T_grad_scale: float = 0.1
 
 class SpiralV9:
-    def __init__(self, V: int = 128, d: int = 96, H: int = 4, L: int = 4, r: int = 64, seed: int = 0):
+    def __init__(self, V: int = 128, d: int = 96, H: int = 4, L: int = 4, r: int = 64,
+                 seed: int = 0, student_cfg: Optional[StudentCfg] = None):
         self.V, self.d, self.H, self.L, self.r = V, d, H, L, r
         self.P = make_bigram(V, seed=7)
         self.teacher = SpiralTeacher(V, d, H, L, r, self.P, TeacherCfg(), seed=42)
-        student_cfg = StudentCfg(L=max(4, L), d=d, k=max(16, d // 4), V=V, r=r, seed=123)
-        self.student = StudentV9(student_cfg, self.teacher.B)
+        cfg = student_cfg or StudentCfg(L=max(4, L), d=d, k=max(16, d // 4), V=V, r=r, seed=123)
+        self.student = StudentV9(cfg, self.teacher.B)
+        self.tokenizer: Optional[SpiralTokenizer] = None
+
+    # ------------------ persistence + inference ------------------
+    def set_tokenizer(self, tokenizer: SpiralTokenizer):
+        self.tokenizer = tokenizer
+
+    def save_weights(self, path: str):
+        state = dict(
+            student_state=self.student.state_dict(),
+            teacher_meta=dict(V=self.V, d=self.d, H=self.H, L=self.L, r=self.r),
+        )
+        if self.tokenizer is not None:
+            state["tokenizer_state"] = self.tokenizer.state_dict()
+        np.savez_compressed(path, **{k: np.array([v], dtype=object) for k, v in state.items()})
+
+    @classmethod
+    def load(cls, path: str) -> "SpiralV9":
+        data = np.load(path, allow_pickle=True)
+        student_raw = data["student_state"]
+        student_state = student_raw[0] if isinstance(student_raw, np.ndarray) else student_raw
+        if hasattr(student_state, "item") and not isinstance(student_state, dict):
+            student_state = student_state.item()
+        meta_raw = data["teacher_meta"] if "teacher_meta" in data else {}
+        meta = meta_raw[0] if isinstance(meta_raw, np.ndarray) else meta_raw
+        if hasattr(meta, "item") and not isinstance(meta, dict):
+            meta = meta.item()
+        cfg = StudentCfg(**student_state["cfg"])
+        V = meta.get("V", cfg.V); d = meta.get("d", cfg.d); H = meta.get("H", 4); L = meta.get("L", cfg.L); r = meta.get("r", cfg.r)
+        eng = cls(V=V, d=d, H=H, L=L, r=r, seed=0, student_cfg=cfg)
+        eng.student.load_state(student_state)
+        eng.teacher.B = eng.student.B  # align teacher logits with loaded student projection
+        if "tokenizer_state" in data:
+            tok_raw = data["tokenizer_state"]
+            tok_state = tok_raw[0] if isinstance(tok_raw, np.ndarray) else tok_raw
+            if hasattr(tok_state, "item") and not isinstance(tok_state, dict):
+                tok_state = tok_state.item()
+            eng.tokenizer = SpiralTokenizer.from_state(tok_state)
+        return eng
+
+    def generate(self, prompt_ids: np.ndarray, max_new_tokens: int = 32,
+                 temperature: float = 1.0, top_p: float = 0.9, rng_seed: Optional[int] = None) -> np.ndarray:
+        rng = np.random.default_rng(rng_seed)
+        tokens = prompt_ids.astype(np.int64).reshape(1, -1)
+        for _ in range(max_new_tokens):
+            logits, _ = self.student.forward(tokens)
+            logits = logits / max(temperature, 1e-4)
+            probs = softmax_rows(logits)
+            p = probs[0]
+            # nucleus sampling
+            sorted_idx = np.argsort(p)[::-1]
+            sorted_p = p[sorted_idx]
+            cdf = np.cumsum(sorted_p)
+            cutoff = sorted_p[cdf <= top_p]
+            if cutoff.size == 0:
+                chosen_idx = sorted_idx[0]
+            else:
+                keep = sorted_idx[: cutoff.size + 1]
+                keep_p = p[keep]; keep_p = keep_p / np.maximum(keep_p.sum(), EPS)
+                chosen_idx = int(rng.choice(keep, p=keep_p))
+            tokens = np.concatenate([tokens, np.array([[chosen_idx]], dtype=np.int64)], axis=1)
+        return tokens[0]
+
+    def generate_text(self, prompt: str, tokenizer: SpiralTokenizer, max_new_tokens: int = 32,
+                      temperature: float = 1.0, top_p: float = 0.9, rng_seed: Optional[int] = None) -> str:
+        ids = tokenizer.encode(prompt, add_special_tokens=True)
+        gen = self.generate(ids[None, :], max_new_tokens=max_new_tokens,
+                            temperature=temperature, top_p=top_p, rng_seed=rng_seed)
+        return tokenizer.decode(gen)
 
     def train(self, cfg: TrainCfg, data_tokens: Optional[np.ndarray] = None) -> List[Dict[str, float]]:
         rng = np.random.default_rng(0)
@@ -967,10 +1116,18 @@ def demo(args=None):
     p.add_argument("--tok_lowercase", action="store_true", help="lowercase text before tokenization")
     p.add_argument("--tok_no_bos", action="store_true", help="disable adding BOS during tokenization")
     p.add_argument("--tok_no_eos", action="store_true", help="disable adding EOS during tokenization")
+    p.add_argument("--save_path", type=str, default=None, help="npz path to save trained student/ tokenizer")
+    p.add_argument("--load_path", type=str, default=None, help="npz path to load a trained model")
+    p.add_argument("--prompt", type=str, default=None, help="text or comma-separated token ids for inference")
+    p.add_argument("--max_new_tokens", type=int, default=32, help="number of new tokens to generate during inference")
+    p.add_argument("--temperature", type=float, default=1.0, help="sampling temperature")
+    p.add_argument("--top_p", type=float, default=0.9, help="top-p nucleus threshold for sampling")
     parsed = p.parse_args(args=args)
 
     data_tokens = None
     vocab_override = parsed.V
+    tokenizer: Optional[SpiralTokenizer] = None
+
     if parsed.data_path:
         data_tokens = np.load(parsed.data_path).astype(np.int64).reshape(-1)
         data_tokens = np.clip(data_tokens, 0, parsed.V - 1)
@@ -986,13 +1143,51 @@ def demo(args=None):
         vocab_override = max(vocab_override, tokenizer.vocab_size)
         data_tokens = np.clip(data_tokens, 0, vocab_override - 1)
 
-    eng = SpiralV9(V=vocab_override, d=parsed.d, H=parsed.H, L=parsed.L, r=parsed.r, seed=0)
-    cfg = TrainCfg(steps=parsed.steps, batch=parsed.batch, ctx_len=parsed.ctx_len,
-                   T0=1.0, lam=1.0, gamma=1.0, Tmin=0.7, Tmax=1.8, topk=48,
-                   lam_distil=0.1, lr_k_stab=0.02, lr_k_expl=0.01,
-                   keepk_boost=2, rho_boost=0.0, backprop_T=True, T_grad_scale=0.1,
-                   data_path=parsed.data_path)
-    logs = eng.train(cfg, data_tokens=data_tokens)
+    if parsed.load_path:
+        eng = SpiralV9.load(parsed.load_path)
+        tokenizer = tokenizer or eng.tokenizer
+    else:
+        eng = SpiralV9(V=vocab_override, d=parsed.d, H=parsed.H, L=parsed.L, r=parsed.r, seed=0)
+
+    if tokenizer is not None:
+        eng.set_tokenizer(tokenizer)
+
+    logs: List[Dict[str, float]] = []
+    if parsed.steps > 0:
+        cfg = TrainCfg(steps=parsed.steps, batch=parsed.batch, ctx_len=parsed.ctx_len,
+                       T0=1.0, lam=1.0, gamma=1.0, Tmin=0.7, Tmax=1.8, topk=48,
+                       lam_distil=0.1, lr_k_stab=0.02, lr_k_expl=0.01,
+                       keepk_boost=2, rho_boost=0.0, backprop_T=True, T_grad_scale=0.1,
+                       data_path=parsed.data_path)
+        logs = eng.train(cfg, data_tokens=data_tokens)
+        if parsed.save_path:
+            eng.save_weights(parsed.save_path)
+            print(f"Saved weights to {parsed.save_path}")
+    elif parsed.save_path and parsed.load_path:
+        # allow re-saving loaded weights without further training
+        eng.save_weights(parsed.save_path)
+        print(f"Re-saved weights to {parsed.save_path}")
+
+    # Inference / decoder
+    if parsed.prompt is not None:
+        rng_seed = 0
+        prompt_is_ids = parsed.prompt.replace(",", "").strip().isdigit()
+        if eng.tokenizer is not None and not prompt_is_ids:
+            text = eng.generate_text(parsed.prompt, eng.tokenizer,
+                                     max_new_tokens=parsed.max_new_tokens,
+                                     temperature=parsed.temperature, top_p=parsed.top_p,
+                                     rng_seed=rng_seed)
+            print(">> generated text:", text)
+        else:
+            try:
+                ids = np.array([int(x) for x in parsed.prompt.split(",") if x.strip() != ""], dtype=np.int64) if prompt_is_ids else \
+                      np.array([min(b, eng.V - 1) for b in parsed.prompt.encode("utf-8")], dtype=np.int64)
+            except ValueError:
+                raise ValueError("Provide a tokenizer or pass comma-separated token ids for prompt")
+            gen = eng.generate(ids, max_new_tokens=parsed.max_new_tokens,
+                               temperature=parsed.temperature, top_p=parsed.top_p, rng_seed=rng_seed)
+            print(">> generated token ids:", gen.tolist())
+
     print("== SpiralFullFusion V9 (compact) Demo — DONE ==")
     return logs
 
