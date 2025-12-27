@@ -849,8 +849,7 @@ class Embedding:
         ids = self._idx.reshape(-1)
         dflat = dE.reshape(B * T, d)
         # accumulate per token id (sparse)
-        for i, idx in enumerate(ids):
-            self.dW[idx] += dflat[i]
+        np.add.at(self.dW, ids, dflat)
     def step(self, lr: float):
         self.W -= lr * self.dW; self.dW.fill(0.0)
 
@@ -1061,6 +1060,86 @@ class StudentV9:
 # ------------------------------
 # Losses + T from Sigma + Backprop wrt T
 # ------------------------------
+def _tok_str(tok, tid: int) -> str:
+    if tok is None:
+        return str(tid)
+    if 0 <= tid < len(tok.id_to_token):
+        return tok.id_to_token[tid]
+    return str(tid)
+
+def _topk_probs(logits_row: np.ndarray, T: float, k: int = 8):
+    p = softmax_rows((logits_row[None, :] / max(T, 1e-6)).astype(np.float32))[0]
+    idx = np.argsort(p)[::-1][:k]
+    return [(int(i), float(p[i])) for i in idx]
+
+def _trace_step(step: int, ctx: np.ndarray, y: np.ndarray,
+                t_logits: np.ndarray, s_logits: np.ndarray,
+                T_s: np.ndarray, T_t: np.ndarray, meanVar_t: np.ndarray,
+                meta: Dict[str, Any], eng, k: int = 8):
+    # batchの先頭だけ見る（十分面白い）
+    b = 0
+    ctx_ids = ctx[b].tolist()
+    yid = int(y[b])
+    Ts = float(T_s[b, 0])
+    Tt = float(T_t[b, 0])
+    mv = float(meanVar_t[b])
+
+    print("\n" + "=" * 90)
+    print(f"[TRACE step {step}]  T_student={Ts:.3f}  T_teacher={Tt:.3f}  meanVar_teacher={mv:.5f}")
+    print(f"keepk={eng.student._keepk.tolist()}  rho={np.round(eng.student.u.rho, 3).tolist()}")
+    if "layer_hazard" in meta:
+        print(f"teacher_hazard={np.round(meta['layer_hazard'], 3).tolist()}  keepk_suggest={meta.get('keepk_suggest', []).tolist()}")
+    print(f"ctx_ids={ctx_ids}")
+    if eng.tokenizer is not None:
+        try:
+            print(f"ctx_text={eng.tokenizer.decode(ctx[b])!r}")
+        except Exception:
+            pass
+    print(f"target={yid}  tok={_tok_str(eng.tokenizer, yid)}")
+
+    # top-k
+    t_top = _topk_probs(t_logits[b], Tt, k=k)
+    s_top = _topk_probs(s_logits[b], Ts, k=k)
+
+    print("\nTeacher top:")
+    for tid, prob in t_top:
+        print(f"  {tid:4d}  p={prob:.4f}  {_tok_str(eng.tokenizer, tid)}")
+    print("\nStudent top:")
+    for tid, prob in s_top:
+        mark = " <==" if tid == yid else ""
+        print(f"  {tid:4d}  p={prob:.4f}  {_tok_str(eng.tokenizer, tid)}{mark}")
+
+    # RAGの重みレンジ
+    rw = eng.teacher.rag_src_weight
+    print(f"\nRAG src weight: min/mean/max = {rw.min():.3f}/{rw.mean():.3f}/{rw.max():.3f}")
+    print("=" * 90 + "\n")
+
+def expected_calibration_error(probs: np.ndarray, y: np.ndarray, n_bins: int = 15) -> float:
+    # probs: [B,V]
+    conf = probs.max(axis=1)
+    pred = probs.argmax(axis=1)
+    acc = (pred == y).astype(np.float32)
+    bins = np.linspace(0.0, 1.0, n_bins + 1, dtype=np.float32)
+    ece = 0.0
+    for i in range(n_bins):
+        lo, hi = float(bins[i]), float(bins[i + 1])
+        if i == 0:
+            m = (conf >= lo) & (conf <= hi)
+        else:
+            m = (conf > lo) & (conf <= hi)
+        if np.any(m):
+            bin_acc = float(acc[m].mean())
+            bin_conf = float(conf[m].mean())
+            bin_frac = float(m.mean())
+            ece += abs(bin_conf - bin_acc) * bin_frac
+    return float(ece)
+
+def brier_score(probs: np.ndarray, y: np.ndarray) -> float:
+    B = y.shape[0]
+    oh = np.zeros_like(probs, dtype=np.float32)
+    oh[np.arange(B), y] = 1.0
+    return float(np.mean((probs - oh) ** 2))
+
 def ce_with_temp(logits: np.ndarray, y: np.ndarray, T: np.ndarray) -> Tuple[float, np.ndarray, np.ndarray]:
     z = logits / np.maximum(T, 1e-6); p = softmax_rows(z)
     B = y.shape[0]; oh = np.zeros_like(p); oh[np.arange(B), y] = 1.0
@@ -1070,12 +1149,24 @@ def ce_with_temp(logits: np.ndarray, y: np.ndarray, T: np.ndarray) -> Tuple[floa
     dlogits = np.clip(dlogits, -5.0, 5.0)
     return float(ce), dlogits.astype(np.float32), p
 
-def kl_teacher_student(teacher_logits: np.ndarray, student_logits: np.ndarray, T: np.ndarray) -> Tuple[float, np.ndarray]:
+def kl_teacher_student(teacher_logits: np.ndarray, student_logits: np.ndarray, T: np.ndarray,
+                       w: Optional[np.ndarray] = None) -> Tuple[float, np.ndarray]:
     q = softmax_rows(teacher_logits / np.maximum(T, 1e-6))
     p = softmax_rows(student_logits / np.maximum(T, 1e-6))
     B = p.shape[0]
-    kl = np.sum(q * (np.log(np.maximum(q, 1e-12)) - np.log(np.maximum(p, 1e-12)))) / max(1, B)
-    dlogits = GRAD_BOOST * (p - q) / np.maximum(T, 1e-6)
+    kl_per = np.sum(q * (np.log(np.maximum(q, 1e-12)) - np.log(np.maximum(p, 1e-12))), axis=1)  # [B]
+
+    if w is None:
+        kl = float(np.mean(kl_per))
+        dlogits = GRAD_BOOST * (p - q) / np.maximum(T, 1e-6)
+    else:
+        w1 = w.reshape(-1).astype(np.float32)
+        w1 = np.clip(w1, 0.0, 1e6)
+        # 平均1になるように正規化（勾配スケールが極端に変わらない）
+        w_scale = w1 / (float(np.mean(w1)) + 1e-6)
+        kl = float(np.sum(kl_per * w1) / (float(np.sum(w1)) + 1e-6))
+        dlogits = GRAD_BOOST * (w_scale[:, None] * (p - q)) / np.maximum(T, 1e-6)
+
     dlogits = np.clip(dlogits, -5.0, 5.0)
     return float(kl), dlogits.astype(np.float32)
 
@@ -1143,6 +1234,11 @@ class TrainCfg:
     distil_warmup: int = 20     # steps before blending in KL
     ce_weight: float = 1.0
     kl_weight: float = 1.0
+    kl_var_alpha: float = 2.0
+    kl_min_w: float = 0.10
+    kl_max_w: float = 1.00
+    trace_every: int = 0   # 0なら無効
+    trace_k: int = 8
     # reliability → rho nudging
     lr_k_stab: float = 0.02; lr_k_expl: float = 0.01
     # hazard → partial optimize
@@ -1344,9 +1440,16 @@ class SpiralV9:
                                                      T0=cfg.T0, lam=cfg.lam, gamma=cfg.gamma,
                                                      Tmin=cfg.Tmin, Tmax=cfg.Tmax, k=cfg.topk)
 
+            if cfg.trace_every and ((step + 1) % cfg.trace_every == 0):
+                _trace_step(step + 1, ctx, y, t_logits, s_logits, T_S, Ts, meanVars, meta, self, k=cfg.trace_k)
+
+            # KL重み（teacherが確信しているほど大きい）
+            w_kl = np.exp(-cfg.kl_var_alpha * meanVars).astype(np.float32)  # [B]
+            w_kl = np.clip(w_kl, cfg.kl_min_w, cfg.kl_max_w)
+
             # losses
             ce, dlogits_ce, p_s = ce_with_temp(s_logits, y, T_S)
-            kl, dlogits_kl = kl_teacher_student(t_logits, s_logits, T_S)
+            kl, dlogits_kl = kl_teacher_student(t_logits, s_logits, T_S, w=w_kl)
             warm = max(0, step + 1 - cfg.distil_warmup)
             distil_phase = float(np.clip(warm / max(1, cfg.distil_warmup), 0.0, 1.0))
             ce_scale = float(cfg.ce_weight)
@@ -1398,8 +1501,10 @@ class SpiralV9:
             # logging
             rag_w = self.teacher.rag_src_weight
             rag_stats = dict(rag_min=float(rag_w.min()), rag_max=float(rag_w.max()), rag_mean=float(rag_w.mean()))
+            ece = expected_calibration_error(p_s, y, n_bins=15)
+            brier = brier_score(p_s, y)
             log_entry = dict(step=step+1, CE=float(ce), KL=float(kl),
-                             ECE=float(np.mean(np.max(p_s, axis=-1) - (np.argmax(p_s, axis=-1) == y).astype(np.float32))),
+                             ECE=float(ece), brier=float(brier),
                              T=float(T_S.mean()), var=float(meanVars.mean()),
                              eta0=float(etas[0]), rho0=float(self.student.u.rho[0]), keepk0=int(self.student._keepk[0]),
                              grad_rms=float(g_rms), grad_scale=float(g_scale),
@@ -1485,6 +1590,11 @@ def demo(args=None):
     p.add_argument("--distil_warmup", type=int, default=20, help="warmup steps before enabling KL distillation")
     p.add_argument("--ce_weight", type=float, default=1.0, help="scaling for CE loss term")
     p.add_argument("--kl_weight", type=float, default=1.0, help="scaling for KL distillation term")
+    p.add_argument("--kl_var_alpha", type=float, default=2.0, help="strength of KL downweighting for uncertain teacher samples")
+    p.add_argument("--kl_min_w", type=float, default=0.10, help="minimum KL weight per sample")
+    p.add_argument("--kl_max_w", type=float, default=1.00, help="maximum KL weight per sample")
+    p.add_argument("--trace_every", type=int, default=0, help="enable X-ray tracing every N steps (0 to disable)")
+    p.add_argument("--trace_k", type=int, default=8, help="top-k candidates to show in trace mode")
     p.add_argument("--rag_m", type=int, default=8, help="top-m RAG sources to fuse from n-gram prior")
     p.add_argument("--rag_w", type=float, default=1.5, help="logit boost weight for n-gram RAG suggestions")
     p.add_argument("--override_rag", action="store_true", help="override loaded teacher rag_m/rag_w with CLI values")
@@ -1547,6 +1657,8 @@ def demo(args=None):
                        T0=1.0, lam=1.0, gamma=1.0, Tmin=0.7, Tmax=1.8, topk=48,
                        lam_distil=0.1, distil_warmup=parsed.distil_warmup,
                        ce_weight=parsed.ce_weight, kl_weight=parsed.kl_weight,
+                       kl_var_alpha=parsed.kl_var_alpha, kl_min_w=parsed.kl_min_w, kl_max_w=parsed.kl_max_w,
+                       trace_every=parsed.trace_every, trace_k=parsed.trace_k,
                        lr_k_stab=0.02, lr_k_expl=0.01,
                        keepk_boost=2, rho_boost=0.0, backprop_T=True, T_grad_scale=0.1,
                        data_path=parsed.data_path)
