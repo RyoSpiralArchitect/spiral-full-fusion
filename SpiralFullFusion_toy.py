@@ -384,6 +384,18 @@ def sample_batch_bigram(P: np.ndarray, ctx_len: int, B: int, rng: np.random.Gene
     y = tokens[:, ctx_len].copy()
     return ctx, y
 
+def bootstrap_trigram_from_bigram(P: np.ndarray, n_tokens: int = 50000, seed: int = 0) -> Dict[Tuple[int, int], np.ndarray]:
+    # Sample a synthetic sequence from the bigram LM to get a richer trigram prior.
+    V = P.shape[0]
+    rng = np.random.default_rng(seed)
+    seq = [int(rng.integers(0, V))]
+    for _ in range(max(0, n_tokens - 1)):
+        prev = seq[-1]
+        nxt = int(rng.choice(np.arange(V), p=P[prev]))
+        seq.append(nxt)
+    tokens = np.array(seq, dtype=np.int64)
+    return trigram_from_tokens(tokens, V)
+
 def trigram_from_tokens(tokens: np.ndarray, V: int, bos_id: int = 2, eos_id: int = 3,
                         smoothing: float = 0.25) -> Dict[Tuple[int, int], np.ndarray]:
     # Sparse trigram with additive smoothing per (a,b) pair.
@@ -617,12 +629,14 @@ class TeacherCfg:
     T0: float = 1.0; lam: float = 1.0; gamma: float = 1.0; Tmin: float = 0.7; Tmax: float = 1.8
     topk: int = 40
     danger_rho_thr: float = 0.8
+    rag_m: int = 8
+    rag_w: float = 1.5
 
 class SpiralTeacher:
     def __init__(self, V: int, d: int, H: int, L: int, r: int, P: np.ndarray, cfg: TeacherCfg, seed: int = 0):
         self.V, self.d, self.H, self.L, self.r = V, d, H, L, r
         self.P = P; self.cfg = cfg
-        self.trigram_map: Optional[Dict[Tuple[int, int], np.ndarray]] = None
+        self.trigram_map: Optional[Dict[Tuple[int, int], np.ndarray]] = bootstrap_trigram_from_bigram(P, seed=seed)
         self.lm = ToyDeepLM(V, d, H, L, seed=seed)
         self.fusers = [BayesHeadFuseLR(d, V, H, r, rho=0.7, tau0=1e-4, seed=seed + l) for l in range(L)]
         # share B across layers
@@ -688,7 +702,7 @@ class SpiralTeacher:
 
             # RAG delta on logits (bCSR) with trigram fallback to bigram
             delta = rag_bcsr_ngram(tokens_batch[b][None, :], self.V, self.P,
-                                   trigram_map=self.trigram_map, m=8, w=1.5)
+                                   trigram_map=self.trigram_map, m=self.cfg.rag_m, w=self.cfg.rag_w)
             tag, indptr, indices, data = delta
             s, e = int(indptr[0]), int(indptr[1])
             inds = indices[s:e]; vals = data[s:e]
@@ -1112,13 +1126,14 @@ class TrainCfg:
 
 class SpiralV9:
     def __init__(self, V: int = 128, d: int = 96, H: int = 4, L: int = 4, r: int = 64,
-                 seed: int = 0, student_cfg: Optional[StudentCfg] = None):
+                 seed: int = 0, student_cfg: Optional[StudentCfg] = None, teacher_cfg: Optional[TeacherCfg] = None):
         self.V, self.d, self.H, self.L, self.r = V, d, H, L, r
         self.seed = seed
         if student_cfg is not None and student_cfg.V != V:
             raise ValueError("StudentCfg.V must match SpiralV9 V to keep vocabulary consistent")
         self.P = make_bigram(V, seed=7 + seed)
-        self.teacher = SpiralTeacher(V, d, H, L, r, self.P, TeacherCfg(), seed=42 + seed)
+        self.teacher_cfg = teacher_cfg or TeacherCfg()
+        self.teacher = SpiralTeacher(V, d, H, L, r, self.P, self.teacher_cfg, seed=42 + seed)
         cfg = student_cfg or StudentCfg(L=max(4, L), d=d, k=max(16, d // 4), V=V, r=r, seed=123 + seed)
         self.student = StudentV9(cfg, self.teacher.B)
         self.tokenizer: Optional[SpiralTokenizer] = None
@@ -1162,6 +1177,7 @@ class SpiralV9:
         eng.student.load_state(student_state)
         if teacher_state is not None:
             eng.teacher.load_state(teacher_state)
+            eng.teacher_cfg = eng.teacher.cfg
         if eng.student.cfg.V != eng.V:
             raise ValueError(f"Loaded student vocab ({eng.student.cfg.V}) does not match engine V ({eng.V})")
         # assert shapes before sharing projection
@@ -1442,6 +1458,8 @@ def demo(args=None):
     p.add_argument("--distil_warmup", type=int, default=5, help="warmup steps before enabling KL distillation")
     p.add_argument("--ce_weight", type=float, default=1.0, help="scaling for CE loss term")
     p.add_argument("--kl_weight", type=float, default=1.0, help="scaling for KL distillation term")
+    p.add_argument("--rag_m", type=int, default=8, help="top-m RAG sources to fuse from n-gram prior")
+    p.add_argument("--rag_w", type=float, default=1.5, help="logit boost weight for n-gram RAG suggestions")
     parsed = p.parse_args(args=args)
 
     data_tokens = None
@@ -1470,11 +1488,14 @@ def demo(args=None):
     if tokenizer is not None:
         vocab_override = max(vocab_override, tokenizer.vocab_size)
 
+    teacher_cfg = TeacherCfg(rag_m=parsed.rag_m, rag_w=parsed.rag_w)
+
     if parsed.load_path:
         eng = SpiralV9.load(parsed.load_path)
         tokenizer = tokenizer or eng.tokenizer
     else:
-        eng = SpiralV9(V=vocab_override, d=parsed.d, H=parsed.H, L=parsed.L, r=parsed.r, seed=parsed.seed)
+        eng = SpiralV9(V=vocab_override, d=parsed.d, H=parsed.H, L=parsed.L, r=parsed.r,
+                       seed=parsed.seed, teacher_cfg=teacher_cfg)
 
     if tokenizer is not None and eng.tokenizer is None:
         eng.set_tokenizer(tokenizer)
