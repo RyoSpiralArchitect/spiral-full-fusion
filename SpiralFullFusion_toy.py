@@ -286,15 +286,39 @@ def sample_batch_bigram(P: np.ndarray, ctx_len: int, B: int, rng: np.random.Gene
     y = tokens[:, ctx_len].copy()
     return ctx, y
 
-def sample_batch_from_array(data: np.ndarray, ctx_len: int, B: int, rng: np.random.Generator, V: int):
-    # data: 1D token ids; wrap if needed
+def _line_spans_from_bos_eos(data: np.ndarray, ctx_len: int, bos_id: int = 2, eos_id: int = 3) -> List[Tuple[int, int]]:
+    # Extract contiguous spans [bos_idx, eos_idx] that are long enough for a ctx_len+1 window.
+    spans: List[Tuple[int, int]] = []
+    bos_positions = np.where(data == bos_id)[0]
+    eos_positions = np.where(data == eos_id)[0]
+    if bos_positions.size == 0 or eos_positions.size == 0:
+        return spans
+    for bos_idx in bos_positions:
+        # find first EOS strictly after this BOS
+        eos_idx_pos = eos_positions[eos_positions > bos_idx]
+        if eos_idx_pos.size == 0:
+            break
+        eos_idx = int(eos_idx_pos[0])
+        # need at least ctx_len+1 tokens before EOS to form (ctx, y) without crossing boundary
+        if eos_idx - bos_idx >= ctx_len + 1:
+            spans.append((int(bos_idx), eos_idx))
+    return spans
+
+def sample_batch_from_array(data: np.ndarray, ctx_len: int, B: int, rng: np.random.Generator, V: int,
+                            bos_id: int = 2, eos_id: int = 3):
+    # data: 1D token ids; avoid crossing BOS/EOS boundaries when possible
     N = data.shape[0]
     if N < ctx_len + 1:
         raise ValueError("data sequence too short for given ctx_len")
+    spans = _line_spans_from_bos_eos(data, ctx_len, bos_id=bos_id, eos_id=eos_id)
     ctx = np.zeros((B, ctx_len), dtype=np.int64)
     y = np.zeros((B,), dtype=np.int64)
     for b in range(B):
-        start = int(rng.integers(0, N - ctx_len))
+        if spans:
+            smin, smax = spans[int(rng.integers(0, len(spans)))]
+            start = int(rng.integers(smin, smax - ctx_len))
+        else:
+            start = int(rng.integers(0, N - ctx_len))
         span = data[start:start+ctx_len+1]
         ctx[b] = span[:-1]
         y[b] = span[-1]
