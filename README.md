@@ -29,6 +29,9 @@ You’ll get a brisk training run that paints the loop: generate → reliability
 - **Custom data or text**: point `--data_path` at a NumPy token array, or `--text_path` at UTF-8 text to train the built-in byte-level tokenizer (configurable with `--tok_*` flags).
 - **Reproducible spins**: use `--seed` to set the base seed for synthetic bigram data and initial weights when starting fresh.
 - **Memory traces per token**: enable `--mem_trace` to print a per-step breakdown of episodic memory influence: top neighbors (similarity/weight/strength/usage), their per-token Δlogit pushes, aggregated boosts, and whether the chosen token was helped by memory. Tune verbosity with `--mem_trace_neighbors`, `--mem_trace_tokens`, and silence empty retrievals via `--mem_trace_only_used`. Override memory logit scaling during generation with `--mem_scale`.
+- **Heatmap “X-ray” mode**: pair `--mem_trace` with `--mem_heatmap` to stream a rolling matplotlib heatmap of memory-driven Δlogits across the last 200 generation steps (configurable via `--mem_heatmap_top`/`--mem_heatmap_steps`).
+- **Self-dialogue taps the teacher**: when the student is uncertain, `--self_dialog` runs a one-off teacher forward pass and injects its top tokens back into the logits (scaled by uncertainty). Tune with `--self_dialog_margin`, `--self_dialog_entropy`, `--self_dialog_top`, and `--self_dialog_alpha`.
+- **Hazard bandit**: flip `--hazard_bandit` to let a per-layer two-armed bandit pick safe vs. risky modes (keep_k / LR deltas) with survival bonuses and spike penalties. Adjust deltas and thresholds via the `--bandit_*` flags.
 
 ## Usage samples
 Train from scratch and save:
@@ -59,6 +62,21 @@ Only show traces when a retrieval actually fires, and scale memory boosts:
 python SpiralFullFusion_toy.py --steps 0 --load_path /tmp/spiral_demo.npz \
   --prompt "hello" --max_new_tokens 20 --mem_trace --mem_trace_only_used \
   --mem_scale 2.5
+```
+
+Watch the “X-ray” heatmap and let the student query the teacher when unsure:
+```bash
+python SpiralFullFusion_toy.py --steps 0 --load_path /tmp/spiral_demo.npz \
+  --prompt "hello spiral" --max_new_tokens 40 \
+  --mem_trace --mem_heatmap --mem_heatmap_top 24 \
+  --self_dialog --self_dialog_margin 0.05 --self_dialog_alpha 2.0
+```
+
+Inject hazard-bandit exploration into training:
+```bash
+python SpiralFullFusion_toy.py --steps 200 --batch 16 --ctx_len 8 \
+  --hazard_bandit --bandit_keepk_risky 3 --bandit_rho_risky -0.3 \
+  --save_path /tmp/spiral_bandit.npz
 ```
 
 ### Toy-friendly defaults
