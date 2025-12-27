@@ -2095,7 +2095,7 @@ class SpiralV9:
                 dbg_uniform = float(np.log(self.V))
                 dbg_oracle = float(-np.log(np.maximum(self.P[ctx[:, -1], y], 1e-12)).mean())
                 dbg_acc = float((np.argmax(p1, axis=1) == y).mean())
-                print(f\"[dbg step {step+1}] nll@T1={dbg_nll:.4f} oracle={dbg_oracle:.4f} uniform={dbg_uniform:.4f} acc@T1={dbg_acc:.3f} gain={self.logit_gain:.1f}\")
+                print(f"[dbg step {step+1}] nll@T1={dbg_nll:.4f} oracle={dbg_oracle:.4f} uniform={dbg_uniform:.4f} acc@T1={dbg_acc:.3f} gain={self.logit_gain:.1f}")
             log_entry = dict(step=step+1, CE=float(ce), KL=float(kl),
                              ECE=float(ece), brier=float(brier),
                              T=float(T_S.mean()), var=float(meanVars.mean()),
