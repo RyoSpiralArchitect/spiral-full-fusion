@@ -1173,10 +1173,13 @@ class Embedding:
         B, T, d = dE.shape
         ids = self._idx.reshape(-1)
         dflat = dE.reshape(B * T, d)
+        scale = 1.0 / max(1, B * T)
         # accumulate per token id (sparse)
-        np.add.at(self.dW, ids, dflat)
+        np.add.at(self.dW, ids, dflat * scale)
     def step(self, lr: float):
-        self.W -= lr * self.dW; self.dW.fill(0.0)
+        dWc = np.clip(self.dW, -1.0, 1.0)
+        self.W -= lr * dWc
+        self.dW.fill(0.0)
 
 class SiLU:
     def __init__(self): self._x = None
@@ -1267,7 +1270,7 @@ class UncertaintyLR:
 @dataclass
 class StudentCfg:
     L: int = 4; d: int = 96; k: int = 24; V: int = 128; r: int = 64
-    base_lr: float = 1e-1; head_lr: float = 1e-1; emb_lr: float = 1e-1
+    base_lr: float = 5e-2; head_lr: float = 5e-2; emb_lr: float = 5e-2
     grad_target: float = 0.1
     seed: int = 123
 
@@ -1364,8 +1367,10 @@ class StudentV9:
     def step(self, grad_layers: Optional[np.ndarray] = None):
         # Adapt the effective LR to keep gradient magnitudes near a target.
         gl = grad_layers if grad_layers is not None else self.grad_rms()
-        g_rms = float(np.mean(gl))
-        g_scale = float(np.clip(self.cfg.grad_target / max(g_rms, 1e-6), 0.2, 10.0))
+        embed_rms = float(np.sqrt(np.mean(self.embed.dW**2))) if self.embed.dW.size > 0 else 0.0
+        g_all = np.concatenate([np.array(gl, dtype=np.float32).reshape(-1), np.array([embed_rms], dtype=np.float32)])
+        g_rms = float(np.mean(g_all))
+        g_scale = float(np.clip(self.cfg.grad_target / max(g_rms, 1e-6), 0.2, 5.0))
         base = self.cfg.base_lr * g_scale
         etas = self.u.eta(base)
         for l, blk in enumerate(self.blocks):
