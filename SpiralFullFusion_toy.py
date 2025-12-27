@@ -1079,7 +1079,7 @@ class SpiralV9:
                       temperature: float = 1.0, top_p: float = 0.9, top_k: Optional[int] = None,
                       rng_seed: Optional[int] = None) -> str:
         ids = tokenizer.encode(prompt, add_special_tokens=True)
-        gen = self.generate(ids[None, :], max_new_tokens=max_new_tokens,
+        gen = self.generate(ids, max_new_tokens=max_new_tokens,
                             temperature=temperature, top_p=top_p, top_k=top_k, rng_seed=rng_seed)
         return tokenizer.decode(gen)
 
@@ -1090,6 +1090,7 @@ class SpiralV9:
         logits_dummy, Ts_dummy, mv_dummy, meta = self.teacher.forward_batch(np.zeros((1, cfg.ctx_len), dtype=np.int64))
         keepk = np.clip(meta["keepk_suggest"], 2, self.student.cfg.k).astype(np.int32)
         self.student.set_keepk_layerwise(keepk)
+        assert self.student.B.shape == (self.student.cfg.r, self.V), "student B shape mismatch with cfg/V"
 
         for step in range(cfg.steps):
             Bn = cfg.batch
