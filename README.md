@@ -28,6 +28,7 @@ You’ll get a brisk training run that paints the loop: generate → reliability
 - **Seeded nucleus sampling**: control stochastic decoding with `--rng_seed`, `--temperature`, `--top_p`, and optional `--top_k`, generating text (if tokenizer present) or raw token IDs.
 - **Custom data or text**: point `--data_path` at a NumPy token array, or `--text_path` at UTF-8 text to train the built-in byte-level tokenizer (configurable with `--tok_*` flags).
 - **Reproducible spins**: use `--seed` to set the base seed for synthetic bigram data and initial weights when starting fresh.
+- **Memory traces per token**: enable `--mem_trace` to print a per-step breakdown of episodic memory influence: top neighbors (similarity/weight/strength/usage), their per-token Δlogit pushes, aggregated boosts, and whether the chosen token was helped by memory. Tune verbosity with `--mem_trace_neighbors`, `--mem_trace_tokens`, and silence empty retrievals via `--mem_trace_only_used`. Override memory logit scaling during generation with `--mem_scale`.
 
 ## Usage samples
 Train from scratch and save:
@@ -44,6 +45,20 @@ python SpiralFullFusion_toy.py --steps 0 --load_path /tmp/spiral_text.npz --prom
 Decode from a saved checkpoint using token IDs:
 ```bash
 python SpiralFullFusion_toy.py --steps 0 --load_path /tmp/spiral_demo.npz --prompt "1,2,3" --max_new_tokens 24 --temperature 1.1 --top_p 0.9
+```
+
+Trace memory influence during decoding (text prompt):
+```bash
+python SpiralFullFusion_toy.py --steps 0 --load_path /tmp/spiral_demo.npz \
+  --prompt "hello" --max_new_tokens 20 --mem_trace \
+  --mem_trace_neighbors 3 --mem_trace_tokens 5
+```
+
+Only show traces when a retrieval actually fires, and scale memory boosts:
+```bash
+python SpiralFullFusion_toy.py --steps 0 --load_path /tmp/spiral_demo.npz \
+  --prompt "hello" --max_new_tokens 20 --mem_trace --mem_trace_only_used \
+  --mem_scale 2.5
 ```
 
 ### Toy-friendly defaults

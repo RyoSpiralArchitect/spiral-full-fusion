@@ -812,12 +812,22 @@ class EpisodicMemory:
             self.ptr = (self.ptr + 1) % int(self.cfg.max_size)
 
     def retrieve(self, query_r: np.ndarray, scale: Optional[float] = None) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Dict[str, Any]]:
+        empty = dict(
+            used=False,
+            max_sim=0.0,
+            mem_idx=np.zeros((0,), dtype=np.int64),
+            mem_sim=np.zeros((0,), dtype=np.float32),
+            mem_w=np.zeros((0,), dtype=np.float32),
+            mem_strength=np.zeros((0,), dtype=np.float32),
+            mem_used=np.zeros((0,), dtype=np.int32),
+            scale=float(self.cfg.logit_scale if scale is None else scale),
+        )
         if (not self.cfg.enable) or self.size <= 0:
-            return None, None, dict(used=False, max_sim=0.0, mem_idx=np.zeros((0,), dtype=np.int64))
+            return None, None, empty
 
         q = self._norm(query_r.astype(np.float32).reshape(-1))
         keys = self.keys[:self.size]  # [N,r]
-        sim = safe_matmul(keys, q.astype(np.float32))            # [N]
+        sim = safe_matmul(keys, q.astype(np.float32))  # [N]
         sim = np.array(sim, dtype=np.float32).reshape(-1)
 
         # strength modulation (weak entries matter less)
@@ -826,14 +836,20 @@ class EpisodicMemory:
 
         max_sim = float(sim_eff.max()) if sim_eff.size > 0 else 0.0
         if max_sim < float(self.cfg.min_sim):
-            return None, None, dict(used=False, max_sim=max_sim, mem_idx=np.zeros((0,), dtype=np.int64))
+            empty["max_sim"] = max_sim
+            return None, None, empty
 
         K = int(max(1, min(self.cfg.retrieve_k, self.size)))
         top_mem = np.argpartition(sim_eff, -K)[-K:]
         top_sim = sim_eff[top_mem].astype(np.float32)
 
+        # sort neighbors for nicer trace (descending)
+        order = np.argsort(top_sim)[::-1]
+        top_mem = top_mem[order].astype(np.int64)
+        top_sim = top_sim[order].astype(np.float32)
+
         temp = float(max(self.cfg.sim_temp, 1e-4))
-        w = softmax_rows((top_sim[None, :] / temp).astype(np.float32))[0]  # [K]
+        w = softmax_rows((top_sim[None, :] / temp).astype(np.float32))[0].astype(np.float32)  # [K]
 
         # weighted mixture of sparse distributions
         acc: Dict[int, float] = {}
@@ -845,21 +861,40 @@ class EpisodicMemory:
             vals = self.val[mi]
             for j in range(m):
                 tid = int(idxs[j])
-                if tid < 0:
-                    continue
-                if tid >= self.V:
+                if tid < 0 or tid >= self.V:
                     continue
                 acc[tid] = acc.get(tid, 0.0) + float(wi) * float(vals[j])
 
         if not acc:
-            return None, None, dict(used=False, max_sim=max_sim, mem_idx=top_mem.astype(np.int64))
+            info = dict(
+                used=False,
+                max_sim=max_sim,
+                mem_idx=top_mem,
+                mem_sim=top_sim,
+                mem_w=w,
+                mem_strength=self.strength[top_mem].astype(np.float32),
+                mem_used=self.used[top_mem].astype(np.int32),
+                scale=float(self.cfg.logit_scale if scale is None else scale),
+            )
+            return None, None, info
 
         inds = np.array(list(acc.keys()), dtype=np.int64)
         vals = np.array([acc[i] for i in inds.tolist()], dtype=np.float32)
 
         sc = float(self.cfg.logit_scale if scale is None else scale)
         vals = (vals * sc).astype(np.float32)
-        return inds, vals, dict(used=True, max_sim=max_sim, mem_idx=top_mem.astype(np.int64))
+
+        info = dict(
+            used=True,
+            max_sim=max_sim,
+            mem_idx=top_mem,
+            mem_sim=top_sim,
+            mem_w=w,
+            mem_strength=self.strength[top_mem].astype(np.float32),
+            mem_used=self.used[top_mem].astype(np.int32),
+            scale=sc,
+        )
+        return inds, vals, info
 
     def state_dict(self) -> Dict[str, Any]:
         return dict(
@@ -1715,27 +1750,38 @@ class SpiralV9:
                  temperature: float = 1.0, top_p: float = 0.9, top_k: Optional[int] = None,
                  rng_seed: Optional[int] = None,
                  use_memory: bool = True,
-                 mem_scale: Optional[float] = None) -> np.ndarray:
+                 mem_scale: Optional[float] = None,
+                 trace_memory: bool = False,
+                 trace_neighbors: int = 3,
+                 trace_tokens: int = 5,
+                 trace_only_when_used: bool = False) -> np.ndarray:
         rng = np.random.default_rng(rng_seed)
         tokens = prompt_ids.astype(np.int64).reshape(1, -1)
         eos_id = getattr(self.tokenizer, "eos_id", 3)
-        for _ in range(max_new_tokens):
-            logits, aux = self.student.forward(tokens, logit_gain=self.logit_gain)
-            # memory boost in logit-space
+
+        for tgen in range(max_new_tokens):
+            logits, aux = self.student.forward(tokens)  # logits: [1,V]
+
+            # ---- memory boost in logit-space (student_mem) ----
+            inds_m = None
+            vals_m = None
+            info_m: Dict[str, Any] = dict(used=False)
+
+            logits_before_mem = logits.copy()
+
             if use_memory and hasattr(self, "student_mem_cfg") and self.student_mem_cfg.enable and hasattr(self, "student_mem"):
-                # gentle decay per token generation (optional, feels nice)
                 self.student_mem.decay()
                 mu_q = aux["mu"][0]  # [r]
                 inds_m, vals_m, info_m = self.student_mem.retrieve(mu_q, scale=mem_scale)
                 if inds_m is not None and inds_m.size > 0:
                     logits[0, inds_m] += vals_m
-                    # light reinforcement during generation
-                    self.student_mem.touch(info_m.get("mem_idx", np.zeros((0,), dtype=np.int64)), alpha=0.01)
 
-            logits = logits / max(temperature, 1e-4)
-            probs = softmax_rows(logits)
+            # sampling distribution
+            logits_samp = logits / max(temperature, 1e-4)
+            probs = softmax_rows(logits_samp)
             p = probs[0]
-            # nucleus sampling with optional top-k truncation before top-p
+
+            # nucleus + optional top-k
             sorted_idx = np.argsort(p)[::-1]
             if top_k is not None and top_k > 0:
                 sorted_idx = sorted_idx[:top_k]
@@ -1745,21 +1791,97 @@ class SpiralV9:
             keep_len = max(1, keep_len)
             keep = sorted_idx[:keep_len]
             keep_p = p[keep] / np.maximum(p[keep].sum(), EPS)
+
             chosen_idx = int(rng.choice(keep, p=keep_p))
+
+            # ---- Memory Trace (print AFTER we know chosen) ----
+            if trace_memory:
+                mem_used = bool(info_m.get("used", False)) and inds_m is not None and vals_m is not None and inds_m.size > 0
+                if (not trace_only_when_used) or mem_used:
+                    ctx_last = int(tokens[0, -1]) if tokens.shape[1] > 0 else -1
+                    print("\n" + "-" * 92)
+                    print(f"[MEMTRACE gen_step {tgen+1:03d}] ctx_last={ctx_last} tok={_tok_str(self.tokenizer, ctx_last)}")
+                    print(f"mem_used={mem_used}  student_mem_size={int(self.student_mem.size)}  max_sim={float(info_m.get('max_sim', 0.0)):.3f}  scale={float(info_m.get('scale', 0.0)):.3f}")
+
+                    if not mem_used:
+                        print("  (no memory retrieval fired)")
+                    else:
+                        # aggregated boosts (top by Δlogit)
+                        order = np.argsort(vals_m)[::-1]
+                        print("\n  Aggregated boosts (top Δlogit):")
+                        for j in order[:max(1, trace_tokens)]:
+                            tid = int(inds_m[j])
+                            dlt = float(vals_m[j])
+                            print(f"    +{dlt:.4f}  tid={tid:4d}  p={float(p[tid]):.4f}  tok={_tok_str(self.tokenizer, tid)}")
+
+                        # neighbor details
+                        mem_idx = info_m.get("mem_idx", np.zeros((0,), dtype=np.int64))
+                        mem_sim = info_m.get("mem_sim", np.zeros((0,), dtype=np.float32))
+                        mem_w = info_m.get("mem_w", np.zeros((0,), dtype=np.float32))
+                        mem_strength = info_m.get("mem_strength", np.zeros((0,), dtype=np.float32))
+                        mem_used_count = info_m.get("mem_used", np.zeros((0,), dtype=np.int32))
+                        sc = float(info_m.get("scale", self.student_mem_cfg.logit_scale if mem_scale is None else mem_scale))
+
+                        print("\n  Neighbors (top):")
+                        nn = int(min(max(1, trace_neighbors), mem_idx.shape[0]))
+                        for i in range(nn):
+                            mi = int(mem_idx[i])
+                            simv = float(mem_sim[i]) if i < mem_sim.shape[0] else 0.0
+                            wi = float(mem_w[i]) if i < mem_w.shape[0] else 0.0
+                            st = float(mem_strength[i]) if i < mem_strength.shape[0] else 0.0
+                            uc = int(mem_used_count[i]) if i < mem_used_count.shape[0] else 0
+                            print(f"    #{i+1} mem[{mi}] sim={simv:.3f} w={wi:.3f} strength={st:.3f} used={uc}")
+
+                            idxs = self.student_mem.idx[mi]
+                            vals = self.student_mem.val[mi]
+                            contrib = (vals * wi * sc).astype(np.float32)  # per-token Δlogit from this neighbor alone
+
+                            jorder = np.argsort(contrib)[::-1]
+                            shown = 0
+                            for jj in jorder.tolist():
+                                tid = int(idxs[jj])
+                                if tid < 0:
+                                    continue
+                                dlt = float(contrib[jj])
+                                if dlt <= 0.0:
+                                    continue
+                                print(f"        +{dlt:.4f} tid={tid:4d} tok={_tok_str(self.tokenizer, tid)} (p_mem={float(vals[jj]):.3f})")
+                                shown += 1
+                                if shown >= max(1, trace_tokens):
+                                    break
+
+                    # chosen info (and whether memory boosted it)
+                    mem_delta = 0.0
+                    if inds_m is not None and vals_m is not None and inds_m.size > 0:
+                        # quick lookup
+                        hit = np.where(inds_m == chosen_idx)[0]
+                        if hit.size > 0:
+                            mem_delta = float(vals_m[int(hit[0])])
+                    print(f"\n  CHOSEN: tid={chosen_idx:4d} p={float(p[chosen_idx]):.4f} memΔ={mem_delta:+.4f} tok={_tok_str(self.tokenizer, chosen_idx)}")
+                    print("-" * 92)
+
+            # append token
             tokens = np.concatenate([tokens, np.array([[chosen_idx]], dtype=np.int64)], axis=1)
             if chosen_idx == eos_id:
                 break
+
         return tokens[0]
 
     def generate_text(self, prompt: str, tokenizer: SpiralTokenizer, max_new_tokens: int = 32,
                       temperature: float = 1.0, top_p: float = 0.9, top_k: Optional[int] = None,
                       rng_seed: Optional[int] = None,
                       use_memory: bool = True,
-                      mem_scale: Optional[float] = None) -> str:
+                      mem_scale: Optional[float] = None,
+                      trace_memory: bool = False,
+                      trace_neighbors: int = 3,
+                      trace_tokens: int = 5,
+                      trace_only_when_used: bool = False) -> str:
         ids = tokenizer.encode(prompt, add_special_tokens=True)
         gen = self.generate(ids, max_new_tokens=max_new_tokens,
                             temperature=temperature, top_p=top_p, top_k=top_k, rng_seed=rng_seed,
-                            use_memory=use_memory, mem_scale=mem_scale)
+                            use_memory=use_memory, mem_scale=mem_scale,
+                            trace_memory=trace_memory, trace_neighbors=trace_neighbors,
+                            trace_tokens=trace_tokens, trace_only_when_used=trace_only_when_used)
         return tokenizer.decode(gen)
 
     def _train_valid_split(self, tokens: np.ndarray, ctx_len: int, valid_frac: float,
@@ -2052,6 +2174,11 @@ def demo(args=None):
     p.add_argument("--top_p", type=float, default=0.9, help="top-p nucleus threshold for sampling")
     p.add_argument("--rng_seed", type=int, default=0, help="seed for sampler reproducibility")
     p.add_argument("--top_k", type=int, default=None, help="optional top-k cutoff before top-p (nucleus) sampling")
+    p.add_argument("--mem_trace", action="store_true", help="print memory trace per generated token")
+    p.add_argument("--mem_trace_neighbors", type=int, default=3, help="how many nearest memories to show")
+    p.add_argument("--mem_trace_tokens", type=int, default=5, help="how many tokens to show per neighbor/aggregate")
+    p.add_argument("--mem_trace_only_used", action="store_true", help="print trace only when memory retrieval fires")
+    p.add_argument("--mem_scale", type=float, default=None, help="override memory logit scale during generation")
     p.add_argument("--log_path", type=str, default=None, help="optional JSON path to save training logs")
     p.add_argument("--max_eval_windows", type=int, default=20000, help="cap evaluation windows to avoid OOM")
     p.add_argument("--distil_warmup", type=int, default=20, help="warmup steps before enabling KL distillation")
@@ -2151,7 +2278,12 @@ def demo(args=None):
             text = eng.generate_text(parsed.prompt, eng.tokenizer,
                                      max_new_tokens=parsed.max_new_tokens,
                                      temperature=parsed.temperature, top_p=parsed.top_p, top_k=parsed.top_k,
-                                     rng_seed=rng_seed)
+                                     rng_seed=rng_seed,
+                                     use_memory=True, mem_scale=parsed.mem_scale,
+                                     trace_memory=parsed.mem_trace,
+                                     trace_neighbors=parsed.mem_trace_neighbors,
+                                     trace_tokens=parsed.mem_trace_tokens,
+                                     trace_only_when_used=parsed.mem_trace_only_used)
             print(">> generated text:", text)
         else:
             try:
@@ -2160,7 +2292,12 @@ def demo(args=None):
             except ValueError:
                 raise ValueError("Provide a tokenizer or pass comma-separated token ids for prompt")
             gen = eng.generate(ids, max_new_tokens=parsed.max_new_tokens,
-                               temperature=parsed.temperature, top_p=parsed.top_p, top_k=parsed.top_k, rng_seed=rng_seed)
+                               temperature=parsed.temperature, top_p=parsed.top_p, top_k=parsed.top_k, rng_seed=rng_seed,
+                               use_memory=True, mem_scale=parsed.mem_scale,
+                               trace_memory=parsed.mem_trace,
+                               trace_neighbors=parsed.mem_trace_neighbors,
+                               trace_tokens=parsed.mem_trace_tokens,
+                               trace_only_when_used=parsed.mem_trace_only_used)
             print(">> generated token ids:", gen.tolist())
 
     print("== SpiralFullFusion V9 (compact) Demo — DONE ==")
