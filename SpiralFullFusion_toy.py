@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 # SpiralFullFusion Toy (compact complete) — reliability dynamics + partial optimization + RAG SHAP + T_S(Σ) backprop
 # NumPy-only, single-file demo. Safe initializations and eps clamps to avoid NaNs.
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 from typing import List, Tuple, Optional, Dict, Any
 import numpy as np
 
@@ -258,6 +258,45 @@ class SpiralTokenizer:
     def vocab_size(self) -> int:
         return len(self.id_to_token)
 
+    # ------------------ persistence helpers ------------------
+    def state_dict(self) -> Dict[str, Any]:
+        return dict(
+            cfg=asdict(self.cfg),
+            special_tokens=self.special_tokens,
+            token_to_id=self.token_to_id,
+            id_to_token=self.id_to_token,
+            id_to_bytes=self.id_to_bytes,
+            merge_ranks=self.merge_ranks,
+            merge_to_id=self.merge_to_id,
+            motif_to_id=self.motif_to_id,
+            motif_lengths=self.motif_lengths,
+        )
+
+    @classmethod
+    def from_state(cls, state: Dict[str, Any]) -> "SpiralTokenizer":
+        cfg = TokenizerCfg(**state["cfg"])
+        tok = cls(cfg)
+        tok.special_tokens = state["special_tokens"]
+        tok.unk_id, tok.pad_id, tok.bos_id, tok.eos_id = range(4)
+        tok.byte_offset = len(tok.special_tokens)
+        tok.token_to_id = state["token_to_id"]
+        tok.id_to_token = state["id_to_token"]
+        tok.id_to_bytes = state["id_to_bytes"]
+        tok.merge_ranks = state["merge_ranks"]
+        tok.merge_to_id = state["merge_to_id"]
+        tok.motif_to_id = state["motif_to_id"]
+        tok.motif_lengths = state["motif_lengths"]
+        return tok
+
+    def save(self, path: str):
+        np.savez_compressed(path, tokenizer_state=np.array([self.state_dict()], dtype=object))
+
+    @classmethod
+    def load(cls, path: str) -> "SpiralTokenizer":
+        data = np.load(path, allow_pickle=True)
+        state = data["tokenizer_state"][0].item()
+        return cls.from_state(state)
+
 # ------------------------------
 # toy bigram data + RAG bCSR scorer
 # ------------------------------
@@ -355,6 +394,17 @@ class ToyDeepLM:
         self.W_heads = rng.normal(0, 0.05, size=(L, H, d, d)).astype(np.float32) / np.sqrt(max(1, d))
         self.b_heads = np.zeros((L, H, d), dtype=np.float32)
 
+    def state_dict(self) -> Dict[str, np.ndarray]:
+        return dict(E=self.E.copy(), W_layers=self.W_layers.copy(), b_layers=self.b_layers.copy(),
+                    W_heads=self.W_heads.copy(), b_heads=self.b_heads.copy())
+
+    def load_state(self, state: Dict[str, np.ndarray]):
+        self.E = state["E"].astype(np.float32)
+        self.W_layers = state["W_layers"].astype(np.float32)
+        self.b_layers = state["b_layers"].astype(np.float32)
+        self.W_heads = state["W_heads"].astype(np.float32)
+        self.b_heads = state["b_heads"].astype(np.float32)
+
     def encode_heads_per_layer(self, tokens: np.ndarray) -> List[List[np.ndarray]]:
         if tokens.ndim == 2: tokens = tokens[0]
         embs = self.E[tokens]    # [T,d]
@@ -402,6 +452,18 @@ class BayesHeadFuseLR:
         B2 = (self.B * self.B)                  # [r,V]
         return safe_matmul(var_r[None, :], B2)[0]  # [V]
 
+    def state_dict(self) -> Dict[str, np.ndarray]:
+        return dict(A=self.A.copy(), B=self.B.copy(), W1=self.W1.copy(), b1=self.b1.copy(),
+                    W2=self.W2.copy(), b2=self.b2.copy(), rho=np.array(self.rho, dtype=np.float32),
+                    tau0=np.array(self.tau0, dtype=np.float32))
+
+    def load_state(self, state: Dict[str, np.ndarray]):
+        self.A = state["A"].astype(np.float32)
+        self.B = state["B"].astype(np.float32)
+        self.W1 = state["W1"].astype(np.float32); self.b1 = state["b1"].astype(np.float32)
+        self.W2 = state["W2"].astype(np.float32); self.b2 = state["b2"].astype(np.float32)
+        self.rho = float(np.array(state["rho"]).item()); self.tau0 = float(np.array(state["tau0"]).item())
+
 class ReliabilityTracker:
     def __init__(self, L: int, H: int, ema: float = 0.7):
         self.L, self.H = L, H; self.ema = float(ema)
@@ -424,6 +486,14 @@ class ReliabilityTracker:
         stab = (self.y > stab_thr).astype(np.float32)
         expl = (self.y <= stab_thr).astype(np.float32)
         return xz, stab, expl
+
+    def state_dict(self) -> Dict[str, np.ndarray]:
+        return dict(x=self.x.copy(), y=self.y.copy(), n=self.n.copy())
+
+    def load_state(self, state: Dict[str, np.ndarray]):
+        self.x = state["x"].astype(np.float32)
+        self.y = state["y"].astype(np.float32)
+        self.n = state["n"].astype(np.int32)
 
 @dataclass
 class TeacherCfg:
@@ -550,6 +620,30 @@ class SpiralTeacher:
 
         meta = dict(meanVar=float(meanVars.mean()), layer_hazard=layer_hazard, keepk_suggest=keepk_suggest)
         return logits, Ts, meanVars, meta
+
+    def state_dict(self) -> Dict[str, Any]:
+        return dict(
+            P=self.P.copy(),
+            lm=self.lm.state_dict(),
+            fusers=[f.state_dict() for f in self.fusers],
+            rel=self.rel.state_dict(),
+            rag_src_weight=self.rag_src_weight.copy(),
+            cfg=asdict(self.cfg),
+        )
+
+    def load_state(self, state: Dict[str, Any]):
+        self.P = state["P"].astype(np.float32)
+        self.cfg = TeacherCfg(**state.get("cfg", asdict(self.cfg)))
+        self.lm.load_state(state["lm"])
+        for f, saved in zip(self.fusers, state["fusers"]):
+            f.load_state(saved)
+        # ensure B is shared after load
+        B0 = self.fusers[0].B
+        for f in self.fusers[1:]:
+            f.B = B0
+        self.B = B0
+        self.rel.load_state(state["rel"])
+        self.rag_src_weight = state.get("rag_src_weight", np.ones((self.V,), dtype=np.float32)).astype(np.float32)
 
 # ------------------------------
 # Student: Rank-K blocks + RankParamHead + UncertaintyLR + T_S(Σ) backprop (approx)
@@ -699,6 +793,49 @@ class StudentV9:
         self.u = UncertaintyLR(cfg.L, init=0.0)
         self._keepk = np.full((cfg.L,), max(2, cfg.k // 2), dtype=np.int32)
 
+    # ------------------ persistence ------------------
+    def _linear_state(self, lin: Linear) -> Dict[str, np.ndarray]:
+        return dict(W=lin.W.copy(), b=lin.b.copy())
+
+    def state_dict(self) -> Dict[str, Any]:
+        blocks = []
+        for blk in self.blocks:
+            blocks.append(dict(
+                attn=dict(q=self._linear_state(blk.attn.q),
+                          k=self._linear_state(blk.attn.k),
+                          v=self._linear_state(blk.attn.v)),
+                ffn=dict(fc1=self._linear_state(blk.ffn.fc1),
+                         fc2=self._linear_state(blk.ffn.fc2)),
+            ))
+        return dict(
+            cfg=asdict(self.cfg),
+            B=self.B.copy(),
+            keepk=self._keepk.copy(),
+            rho=self.u.rho.copy(),
+            embed=dict(W=self.embed.W.copy()),
+            blocks=blocks,
+            rank_head=dict(mean=self._linear_state(self.rank_head.mean),
+                           logtau=self._linear_state(self.rank_head.logtau)),
+        )
+
+    def load_state(self, state: Dict[str, Any]):
+        self.cfg = StudentCfg(**state["cfg"])
+        self.B = state["B"].astype(np.float32)
+        self._keepk = state["keepk"].astype(np.int32)
+        self.u.rho = state["rho"].astype(np.float32)
+        self.embed.W = state["embed"]["W"].astype(np.float32)
+        for blk, sd in zip(self.blocks, state["blocks"]):
+            for lin, ld in zip((blk.attn.q, blk.attn.k, blk.attn.v), (sd["attn"]["q"], sd["attn"]["k"], sd["attn"]["v"])):
+                lin.W = ld["W"].astype(np.float32); lin.b = ld["b"].astype(np.float32)
+            blk.ffn.fc1.W = sd["ffn"]["fc1"]["W"].astype(np.float32); blk.ffn.fc1.b = sd["ffn"]["fc1"]["b"].astype(np.float32)
+            blk.ffn.fc2.W = sd["ffn"]["fc2"]["W"].astype(np.float32); blk.ffn.fc2.b = sd["ffn"]["fc2"]["b"].astype(np.float32)
+        self.rank_head.mean.W = state["rank_head"]["mean"]["W"].astype(np.float32)
+        self.rank_head.mean.b = state["rank_head"]["mean"]["b"].astype(np.float32)
+        self.rank_head.logtau.W = state["rank_head"]["logtau"]["W"].astype(np.float32)
+        self.rank_head.logtau.b = state["rank_head"]["logtau"]["b"].astype(np.float32)
+        # keepk size might mismatch if cfg changed; clamp safely
+        self._keepk = np.clip(self._keepk, 2, self.cfg.k)
+
     def set_keepk_layerwise(self, keepk: np.ndarray):
         # Accept keepk arrays shorter/longer than student depth and broadcast safely.
         kk = np.clip(keepk.astype(np.int32), 2, self.cfg.k)
@@ -843,12 +980,102 @@ class TrainCfg:
     backprop_T: bool = True; T_grad_scale: float = 0.1
 
 class SpiralV9:
-    def __init__(self, V: int = 128, d: int = 96, H: int = 4, L: int = 4, r: int = 64, seed: int = 0):
+    def __init__(self, V: int = 128, d: int = 96, H: int = 4, L: int = 4, r: int = 64,
+                 seed: int = 0, student_cfg: Optional[StudentCfg] = None):
         self.V, self.d, self.H, self.L, self.r = V, d, H, L, r
-        self.P = make_bigram(V, seed=7)
-        self.teacher = SpiralTeacher(V, d, H, L, r, self.P, TeacherCfg(), seed=42)
-        student_cfg = StudentCfg(L=max(4, L), d=d, k=max(16, d // 4), V=V, r=r, seed=123)
-        self.student = StudentV9(student_cfg, self.teacher.B)
+        self.seed = seed
+        self.P = make_bigram(V, seed=7 + seed)
+        self.teacher = SpiralTeacher(V, d, H, L, r, self.P, TeacherCfg(), seed=42 + seed)
+        cfg = student_cfg or StudentCfg(L=max(4, L), d=d, k=max(16, d // 4), V=V, r=r, seed=123 + seed)
+        self.student = StudentV9(cfg, self.teacher.B)
+        self.tokenizer: Optional[SpiralTokenizer] = None
+
+    # ------------------ persistence + inference ------------------
+    def set_tokenizer(self, tokenizer: SpiralTokenizer):
+        self.tokenizer = tokenizer
+
+    def save_weights(self, path: str):
+        state = dict(
+            student_state=self.student.state_dict(),
+            teacher_meta=dict(V=self.V, d=self.d, H=self.H, L=self.L, r=self.r, seed=self.seed),
+            teacher_state=self.teacher.state_dict(),
+        )
+        if self.tokenizer is not None:
+            state["tokenizer_state"] = self.tokenizer.state_dict()
+        np.savez_compressed(path, **{k: np.array([v], dtype=object) for k, v in state.items()})
+
+    @classmethod
+    def load(cls, path: str) -> "SpiralV9":
+        data = np.load(path, allow_pickle=True)
+        student_raw = data["student_state"]
+        student_state = student_raw[0] if isinstance(student_raw, np.ndarray) else student_raw
+        if hasattr(student_state, "item") and not isinstance(student_state, dict):
+            student_state = student_state.item()
+        meta_raw = data["teacher_meta"] if "teacher_meta" in data else {}
+        meta = meta_raw[0] if isinstance(meta_raw, np.ndarray) else meta_raw
+        if hasattr(meta, "item") and not isinstance(meta, dict):
+            meta = meta.item()
+        teacher_raw = data["teacher_state"] if "teacher_state" in data else None
+        teacher_state = None
+        if teacher_raw is not None:
+            teacher_state = teacher_raw[0] if isinstance(teacher_raw, np.ndarray) else teacher_raw
+            if hasattr(teacher_state, "item") and not isinstance(teacher_state, dict):
+                teacher_state = teacher_state.item()
+        cfg = StudentCfg(**student_state["cfg"])
+        V = meta.get("V", cfg.V); d = meta.get("d", cfg.d); H = meta.get("H", 4); L = meta.get("L", cfg.L); r = meta.get("r", cfg.r)
+        base_seed = meta.get("seed", 0)
+        eng = cls(V=V, d=d, H=H, L=L, r=r, seed=base_seed, student_cfg=cfg)
+        eng.student.load_state(student_state)
+        if teacher_state is not None:
+            eng.teacher.load_state(teacher_state)
+        # assert shapes before sharing projection
+        assert eng.student.B.shape == eng.teacher.fusers[0].B.shape, "B shape mismatch"
+        assert eng.student.cfg.r == eng.student.B.shape[0], "student r mismatch"
+        assert eng.V == eng.student.B.shape[1], "V mismatch"
+        # align teacher logits with loaded student projection (B is shared)
+        eng.teacher.B = eng.student.B
+        for f in eng.teacher.fusers:
+            f.B = eng.student.B
+        if "tokenizer_state" in data:
+            tok_raw = data["tokenizer_state"]
+            tok_state = tok_raw[0] if isinstance(tok_raw, np.ndarray) else tok_raw
+            if hasattr(tok_state, "item") and not isinstance(tok_state, dict):
+                tok_state = tok_state.item()
+            eng.tokenizer = SpiralTokenizer.from_state(tok_state)
+        return eng
+
+    def generate(self, prompt_ids: np.ndarray, max_new_tokens: int = 32,
+                 temperature: float = 1.0, top_p: float = 0.9, rng_seed: Optional[int] = None) -> np.ndarray:
+        rng = np.random.default_rng(rng_seed)
+        tokens = prompt_ids.astype(np.int64).reshape(1, -1)
+        eos_id = getattr(self.tokenizer, "eos_id", 3)
+        for _ in range(max_new_tokens):
+            logits, _ = self.student.forward(tokens)
+            logits = logits / max(temperature, 1e-4)
+            probs = softmax_rows(logits)
+            p = probs[0]
+            # nucleus sampling
+            sorted_idx = np.argsort(p)[::-1]
+            sorted_p = p[sorted_idx]
+            cdf = np.cumsum(sorted_p)
+            cutoff = sorted_p[cdf <= top_p]
+            if cutoff.size == 0:
+                chosen_idx = sorted_idx[0]
+            else:
+                keep = sorted_idx[: cutoff.size + 1]
+                keep_p = p[keep]; keep_p = keep_p / np.maximum(keep_p.sum(), EPS)
+                chosen_idx = int(rng.choice(keep, p=keep_p))
+            tokens = np.concatenate([tokens, np.array([[chosen_idx]], dtype=np.int64)], axis=1)
+            if chosen_idx == eos_id:
+                break
+        return tokens[0]
+
+    def generate_text(self, prompt: str, tokenizer: SpiralTokenizer, max_new_tokens: int = 32,
+                      temperature: float = 1.0, top_p: float = 0.9, rng_seed: Optional[int] = None) -> str:
+        ids = tokenizer.encode(prompt, add_special_tokens=True)
+        gen = self.generate(ids[None, :], max_new_tokens=max_new_tokens,
+                            temperature=temperature, top_p=top_p, rng_seed=rng_seed)
+        return tokenizer.decode(gen)
 
     def train(self, cfg: TrainCfg, data_tokens: Optional[np.ndarray] = None) -> List[Dict[str, float]]:
         rng = np.random.default_rng(0)
@@ -951,6 +1178,16 @@ class SpiralV9:
 # ------------------------------
 def demo(args=None):
     import argparse
+    def _looks_like_id_list(s: str) -> bool:
+        parts = [p.strip() for p in s.split(",") if p.strip() != ""]
+        if not parts:
+            return False
+        for p in parts:
+            if p.startswith("-"):
+                p = p[1:]
+            if not p.isdigit():
+                return False
+        return True
     p = argparse.ArgumentParser(description="SpiralFullFusion toy demo")
     p.add_argument("--steps", type=int, default=500)
     p.add_argument("--batch", type=int, default=16)
@@ -960,6 +1197,7 @@ def demo(args=None):
     p.add_argument("--H", type=int, default=4)
     p.add_argument("--L", type=int, default=4)
     p.add_argument("--r", type=int, default=64)
+    p.add_argument("--seed", type=int, default=0, help="base seed for synthetic data/initialization")
     p.add_argument("--data_path", type=str, default=None, help="optional npy file with token ids")
     p.add_argument("--text_path", type=str, default=None, help="optional utf-8 text file to train tokenizer + dataset")
     p.add_argument("--tok_vocab", type=int, default=256, help="tokenizer vocab size target when using text_path")
@@ -967,10 +1205,19 @@ def demo(args=None):
     p.add_argument("--tok_lowercase", action="store_true", help="lowercase text before tokenization")
     p.add_argument("--tok_no_bos", action="store_true", help="disable adding BOS during tokenization")
     p.add_argument("--tok_no_eos", action="store_true", help="disable adding EOS during tokenization")
+    p.add_argument("--save_path", type=str, default=None, help="npz path to save trained student/ tokenizer")
+    p.add_argument("--load_path", type=str, default=None, help="npz path to load a trained model")
+    p.add_argument("--prompt", type=str, default=None, help="text or comma-separated token ids for inference")
+    p.add_argument("--max_new_tokens", type=int, default=32, help="number of new tokens to generate during inference")
+    p.add_argument("--temperature", type=float, default=1.0, help="sampling temperature")
+    p.add_argument("--top_p", type=float, default=0.9, help="top-p nucleus threshold for sampling")
+    p.add_argument("--rng_seed", type=int, default=0, help="seed for sampler reproducibility")
     parsed = p.parse_args(args=args)
 
     data_tokens = None
     vocab_override = parsed.V
+    tokenizer: Optional[SpiralTokenizer] = None
+
     if parsed.data_path:
         data_tokens = np.load(parsed.data_path).astype(np.int64).reshape(-1)
         data_tokens = np.clip(data_tokens, 0, parsed.V - 1)
@@ -986,13 +1233,51 @@ def demo(args=None):
         vocab_override = max(vocab_override, tokenizer.vocab_size)
         data_tokens = np.clip(data_tokens, 0, vocab_override - 1)
 
-    eng = SpiralV9(V=vocab_override, d=parsed.d, H=parsed.H, L=parsed.L, r=parsed.r, seed=0)
-    cfg = TrainCfg(steps=parsed.steps, batch=parsed.batch, ctx_len=parsed.ctx_len,
-                   T0=1.0, lam=1.0, gamma=1.0, Tmin=0.7, Tmax=1.8, topk=48,
-                   lam_distil=0.1, lr_k_stab=0.02, lr_k_expl=0.01,
-                   keepk_boost=2, rho_boost=0.0, backprop_T=True, T_grad_scale=0.1,
-                   data_path=parsed.data_path)
-    logs = eng.train(cfg, data_tokens=data_tokens)
+    if parsed.load_path:
+        eng = SpiralV9.load(parsed.load_path)
+        tokenizer = tokenizer or eng.tokenizer
+    else:
+        eng = SpiralV9(V=vocab_override, d=parsed.d, H=parsed.H, L=parsed.L, r=parsed.r, seed=parsed.seed)
+
+    if tokenizer is not None:
+        eng.set_tokenizer(tokenizer)
+
+    logs: List[Dict[str, float]] = []
+    if parsed.steps > 0:
+        cfg = TrainCfg(steps=parsed.steps, batch=parsed.batch, ctx_len=parsed.ctx_len,
+                       T0=1.0, lam=1.0, gamma=1.0, Tmin=0.7, Tmax=1.8, topk=48,
+                       lam_distil=0.1, lr_k_stab=0.02, lr_k_expl=0.01,
+                       keepk_boost=2, rho_boost=0.0, backprop_T=True, T_grad_scale=0.1,
+                       data_path=parsed.data_path)
+        logs = eng.train(cfg, data_tokens=data_tokens)
+        if parsed.save_path:
+            eng.save_weights(parsed.save_path)
+            print(f"Saved weights to {parsed.save_path}")
+    elif parsed.save_path and parsed.load_path:
+        # allow re-saving loaded weights without further training
+        eng.save_weights(parsed.save_path)
+        print(f"Re-saved weights to {parsed.save_path}")
+
+    # Inference / decoder
+    if parsed.prompt is not None:
+        rng_seed = parsed.rng_seed
+        prompt_is_ids = _looks_like_id_list(parsed.prompt)
+        if eng.tokenizer is not None and not prompt_is_ids:
+            text = eng.generate_text(parsed.prompt, eng.tokenizer,
+                                     max_new_tokens=parsed.max_new_tokens,
+                                     temperature=parsed.temperature, top_p=parsed.top_p,
+                                     rng_seed=rng_seed)
+            print(">> generated text:", text)
+        else:
+            try:
+                ids = np.array([int(x) for x in parsed.prompt.split(",") if x.strip() != ""], dtype=np.int64) if prompt_is_ids else \
+                      np.array([min(b, eng.V - 1) for b in parsed.prompt.encode("utf-8")], dtype=np.int64)
+            except ValueError:
+                raise ValueError("Provide a tokenizer or pass comma-separated token ids for prompt")
+            gen = eng.generate(ids, max_new_tokens=parsed.max_new_tokens,
+                               temperature=parsed.temperature, top_p=parsed.top_p, rng_seed=rng_seed)
+            print(">> generated token ids:", gen.tolist())
+
     print("== SpiralFullFusion V9 (compact) Demo — DONE ==")
     return logs
 
