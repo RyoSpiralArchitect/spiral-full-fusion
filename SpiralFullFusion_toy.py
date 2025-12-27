@@ -653,7 +653,7 @@ class ReliabilityTracker:
 class TeacherCfg:
     T0: float = 1.0; lam: float = 1.0; gamma: float = 1.0; Tmin: float = 0.7; Tmax: float = 1.8
     topk: int = 40
-    danger_rho_thr: float = 0.8
+    danger_rho_thr: float = 0.3
     rag_m: int = 8
     rag_w: float = 1.5
 
@@ -1253,8 +1253,8 @@ class RankParamHead:
         dh = np.zeros((B, 1, d), dtype=np.float32)
         dh[:, -1, :] = dlast
         return dh
-    def step(self, lr: float):
-        self.mean.step(lr); self.logtau.step(lr)
+    def step(self, lr: float, logtau_lr_scale: float = 1.0):
+        self.mean.step(lr); self.logtau.step(lr * logtau_lr_scale)
 
 class UncertaintyLR:
     def __init__(self, L: int, init: float = 0.0):
@@ -1361,15 +1361,16 @@ class StudentV9:
             dh = self.blocks[l].backward(dh)
         self.embed.backward(dh)
 
-    def step(self):
+    def step(self, grad_layers: Optional[np.ndarray] = None):
         # Adapt the effective LR to keep gradient magnitudes near a target.
-        g_rms = float(np.mean(self.grad_rms()))
+        gl = grad_layers if grad_layers is not None else self.grad_rms()
+        g_rms = float(np.mean(gl))
         g_scale = float(np.clip(self.cfg.grad_target / max(g_rms, 1e-6), 0.2, 10.0))
         base = self.cfg.base_lr * g_scale
         etas = self.u.eta(base)
         for l, blk in enumerate(self.blocks):
             blk.step(float(etas[l]))
-        self.rank_head.step(self.cfg.head_lr * g_scale)
+        self.rank_head.step(self.cfg.head_lr * g_scale, logtau_lr_scale=2.0)
         self.embed.step(self.cfg.emb_lr * g_scale)
         return etas, g_rms, g_scale
 
@@ -1555,7 +1556,7 @@ class TrainCfg:
     # student T hyper
     T0: float = 1.0; lam: float = 1.0; gamma: float = 1.0; Tmin: float = 0.7; Tmax: float = 1.8; topk: int = 40
     # distillation weight (single membrane for compactness)
-    lam_distil: float = 0.7
+    lam_distil: float = 0.2
     distil_warmup: int = 20     # steps before blending in KL
     ce_weight: float = 1.0
     kl_weight: float = 1.0
@@ -1567,7 +1568,7 @@ class TrainCfg:
     # reliability → rho nudging
     lr_k_stab: float = 0.02; lr_k_expl: float = 0.01
     # hazard → partial optimize
-    keepk_boost: int = 2; rho_boost: float = 0.0
+    keepk_boost: int = 1; rho_boost: float = 0.0
     # T backprop switch & scale
     backprop_T: bool = True; T_grad_scale: float = 0.1
 
@@ -1873,10 +1874,33 @@ class SpiralV9:
                                  Tmin=cfg.Tmin, Tmax=cfg.Tmax)  # [B,r]
                 dSigma_T = (cfg.T_grad_scale * dC) * dTdS       # [B,r]
 
-            # backward + step
+            # backward + hazard using grad stats before the optimizer resets them
             self.student.backward(dlogits, aux, dSigma_from_T=dSigma_T)
             embed_gnorm = float(np.linalg.norm(self.student.embed.dW))
-            etas, g_rms, g_scale = self.student.step()
+            grad_layers = self.student.grad_rms()
+
+            # partial optimization (hazard)
+            hazard_teach = meta["layer_hazard"].copy()  # [L_teach] from teacher reliability
+            hazard_grad = hazard_teach.copy()           # gradient-derived proxy for control
+            for l_t in range(self.teacher.L):
+                idx = min(l_t, grad_layers.shape[0]-1)
+                hazard_grad[l_t] = float(np.clip(grad_layers[idx] / 0.02, 0.0, 1.0))
+            keepk_new = self.student._keepk.copy()
+            keepk_step = max(1, int(round(cfg.keepk_boost)))
+            for l in range(self.student.cfg.L):
+                l_t = min(l, self.teacher.L - 1)
+                hg = hazard_grad[l_t]
+                if hg > 0.6:
+                    keepk_new[l] = int(np.clip(keepk_new[l] + keepk_step, 2, self.student.cfg.k))
+                    self.student.u.rho[l] += cfg.rho_boost  # reduce LR
+                elif hg < 0.2:
+                    keepk_new[l] = int(np.clip(keepk_new[l] - keepk_step, 2, self.student.cfg.k))
+            # re-clamp after hazard nudging to prevent runaway shrinkage of learning rate
+            self.student.u.rho = np.clip(self.student.u.rho, -2.0, 2.0)
+            self.student.u.rho *= 0.999
+            self.student.set_keepk_layerwise(keepk_new)
+
+            etas, g_rms, g_scale = self.student.step(grad_layers=grad_layers)
             embed_delta = float(np.linalg.norm(self.student.embed.W - embed_prev))
 
             # reliability → rho nudging
@@ -1887,24 +1911,6 @@ class SpiralV9:
                 stab_ratio = float(np.mean(stab[l_t])); expl_ratio = float(np.mean(expl[l_t]))
                 self.student.u.rho[l] += cfg.lr_k_expl * expl_ratio - cfg.lr_k_stab * stab_ratio
                 self.student.u.rho[l] = float(np.clip(self.student.u.rho[l], -2.0, 2.0))
-
-            # partial optimization (hazard)
-            hazard_teach = meta["layer_hazard"].copy()  # [L_teach] from teacher reliability
-            hazard_grad = hazard_teach.copy()           # gradient-derived proxy for control
-            grad_layers = self.student.grad_rms()
-            for l_t in range(self.teacher.L):
-                idx = min(l_t, grad_layers.shape[0]-1)
-                hazard_grad[l_t] = float(np.clip(grad_layers[idx] / 0.02, 0.0, 1.0))
-            keepk_new = self.student._keepk.copy()
-            for l in range(self.student.cfg.L):
-                l_t = min(l, self.teacher.L - 1)
-                if hazard_grad[l_t] > self.teacher.cfg.danger_rho_thr:
-                    keepk_new[l] = int(np.clip(keepk_new[l] + cfg.keepk_boost, 2, self.student.cfg.k))
-                    self.student.u.rho[l] += cfg.rho_boost  # reduce LR
-            # re-clamp after hazard nudging to prevent runaway shrinkage of learning rate
-            self.student.u.rho = np.clip(self.student.u.rho, -2.0, 2.0)
-            self.student.u.rho *= 0.999
-            self.student.set_keepk_layerwise(keepk_new)
 
             # logging
             rag_w = self.teacher.rag_src_weight
@@ -1946,6 +1952,7 @@ class SpiralV9:
                     print(" | ".join(msg))
             logs.append(log_entry)
             if (step+1) % 5 == 0:
+                print("DBG grad_layers=", grad_layers.tolist(), "hazard_grad=", hazard_grad.tolist())
                 print(f"[{step+1:03d}] CE={ce:.4f} KL={kl:.4f} ECE={logs[-1]['ECE']:.4f} | "
                       f"T={T_S.mean():.3f} var~={meanVars.mean():.4f} | η0={etas[0]:.4e} ρ0={self.student.u.rho[0]:+.3f} keepk0={self.student._keepk[0]} | "
                       f"g_rms={g_rms:.4e} g_scale={g_scale:.2f} | hazard_t~{hazard_teach.mean():.3f} hazard_g~{hazard_grad.mean():.3f} | "
@@ -2069,12 +2076,12 @@ def demo(args=None):
         cfg = TrainCfg(steps=parsed.steps, batch=parsed.batch, ctx_len=parsed.ctx_len,
                        valid_frac=parsed.valid_frac, eval_every=parsed.eval_every, max_eval_windows=parsed.max_eval_windows,
                        T0=1.0, lam=1.0, gamma=1.0, Tmin=0.7, Tmax=1.8, topk=48,
-                       lam_distil=0.1, distil_warmup=parsed.distil_warmup,
+                       lam_distil=0.2, distil_warmup=parsed.distil_warmup,
                        ce_weight=parsed.ce_weight, kl_weight=parsed.kl_weight,
                        kl_var_alpha=parsed.kl_var_alpha, kl_min_w=parsed.kl_min_w, kl_max_w=parsed.kl_max_w,
                        trace_every=parsed.trace_every, trace_k=parsed.trace_k,
                        lr_k_stab=0.02, lr_k_expl=0.01,
-                       keepk_boost=2, rho_boost=0.0, backprop_T=True, T_grad_scale=0.1,
+                       keepk_boost=1, rho_boost=0.0, backprop_T=True, T_grad_scale=0.1,
                        data_path=parsed.data_path)
         logs = eng.train(cfg, data_tokens=data_tokens)
         if logs and parsed.log_path:
