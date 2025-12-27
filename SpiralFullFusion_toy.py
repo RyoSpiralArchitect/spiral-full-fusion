@@ -34,6 +34,23 @@ def safe_matmul(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     y = np.nan_to_num(y, nan=0.0, posinf=1e6, neginf=-1e6).astype(np.float32)
     return y
 
+
+def apply_logit_gain(logits: np.ndarray, gain: float, target_std: float = 1.0, max_scale: float = 200.0) -> Tuple[np.ndarray, float]:
+    """
+    Rescale logits to avoid near-uniform outputs.
+      - gain > 0: use directly (clamped to max_scale)
+      - gain <= 0: auto-scale to reach target_std of logits
+    Returns (scaled_logits, gain_used).
+    """
+    g = float(gain)
+    if g <= 0.0:
+        std = float(np.std(logits))
+        if not np.isfinite(std):
+            std = 0.0
+        g = target_std / max(std, 1e-6)
+    g = float(np.clip(g, 1e-3, max_scale))
+    return (logits * g).astype(np.float32), g
+
 # ------------------------------
 # Pure-Python tokenizer (byte-level BPE-ish)
 # ------------------------------
@@ -656,6 +673,8 @@ class TeacherCfg:
     danger_rho_thr: float = 0.3
     rag_m: int = 8
     rag_w: float = 1.5
+    logit_gain: float = -1.0  # <=0 enables auto gain based on logit std
+    logit_gain: float = 200.0
 
 # ------------------------------
 # Episodic Memory (kNN-RAG): key=rank mu (r-dim), value=sparse next-token distribution (top-m probs)
@@ -922,7 +941,8 @@ class SpiralTeacher:
 
     def forward_batch(self, tokens_batch: np.ndarray,
                       targets: Optional[np.ndarray] = None,
-                      update_memory: bool = False) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Dict[str, Any]]:
+                      update_memory: bool = False,
+                      logit_gain: Optional[float] = None) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Dict[str, Any]]:
         Bn = tokens_batch.shape[0]
         logits = np.zeros((Bn, self.V), dtype=np.float32)
         Ts = np.zeros((Bn, 1), dtype=np.float32)
@@ -1078,6 +1098,9 @@ class SpiralTeacher:
         mem_reward_frac = float(mem_rewarded) / max(1, mem_used)
         mem_punish_frac = float(mem_punished) / max(1, mem_used)
 
+        gain = float(self.cfg.logit_gain if logit_gain is None else logit_gain)
+        logits, gain_used = apply_logit_gain(logits, gain, target_std=1.0, max_scale=200.0)
+
         meta = dict(
             meanVar=float(meanVars.mean()),
             layer_hazard=layer_hazard,
@@ -1088,6 +1111,7 @@ class SpiralTeacher:
             mem_mean_strength=mem_mean_strength,
             mem_reward_frac=mem_reward_frac,
             mem_punish_frac=mem_punish_frac,
+            logit_gain_used=float(gain_used),
         )
         return logits, Ts, meanVars, meta
 
@@ -1112,7 +1136,10 @@ class SpiralTeacher:
             # legacy tuple-keyed dict fallback
             trig_map = {tuple(k): np.array(v, dtype=np.float32) for k, v in trig.items()}
         self.trigram_map = trig_map
-        self.cfg = TeacherCfg(**state.get("cfg", asdict(self.cfg)))
+        cfg_raw = state.get("cfg", asdict(self.cfg))
+        if "logit_gain" not in cfg_raw:
+            cfg_raw = {**asdict(self.cfg), **cfg_raw}
+        self.cfg = TeacherCfg(**cfg_raw)
         self.lm.load_state(state["lm"])
         for f, saved in zip(self.fusers, state["fusers"]):
             f.load_state(saved)
@@ -1336,7 +1363,7 @@ class StudentV9:
             kk = np.concatenate([kk, np.full((self.cfg.L - kk.size,), pad_val, dtype=np.int32)])
         self._keepk = kk[: self.cfg.L].copy()
 
-    def forward(self, tokens: np.ndarray) -> Tuple[np.ndarray, Dict[str, Any]]:
+    def forward(self, tokens: np.ndarray, logit_gain: float = 1.0) -> Tuple[np.ndarray, Dict[str, Any]]:
         x = self.embed.forward(tokens)  # [B,T,d]
         h = x; attn_maps = []
         for l, blk in enumerate(self.blocks):
@@ -1345,7 +1372,8 @@ class StudentV9:
         mu, tau = self.rank_head.forward(h)  # [B,r], [B,r]
         logits = safe_matmul(mu, self.B)     # [B,V]
         Sigma = 1.0 / np.maximum(tau, 1e-6)  # [B,r]
-        return logits, dict(h=h, mu=mu, tau=tau, Sigma=Sigma, attn=attn_maps)
+        logits, gain_used = apply_logit_gain(logits, logit_gain, target_std=1.0, max_scale=200.0)
+        return logits, dict(h=h, mu=mu, tau=tau, Sigma=Sigma, attn=attn_maps, logit_gain_used=float(gain_used))
 
     def backward(self, dlogits: np.ndarray, aux: Dict[str, Any], dSigma_from_T: Optional[np.ndarray] = None):
         # dmu from logits
@@ -1576,6 +1604,8 @@ class TrainCfg:
     keepk_boost: int = 1; rho_boost: float = 0.0
     # T backprop switch & scale
     backprop_T: bool = True; T_grad_scale: float = 0.1
+    # logits are tiny by design; multiply for numerically healthy softmax
+    logit_gain: float = -1.0  # <=0 enables auto gain based on logit std
 
 class SpiralV9:
     def __init__(self, V: int = 128, d: int = 96, H: int = 4, L: int = 4, r: int = 64,
@@ -1589,6 +1619,7 @@ class SpiralV9:
         self.teacher = SpiralTeacher(V, d, H, L, r, self.P, self.teacher_cfg, seed=42 + seed)
         cfg = student_cfg or StudentCfg(L=max(4, L), d=d, k=max(16, d // 4), V=V, r=r, seed=123 + seed)
         self.student = StudentV9(cfg, self.teacher.B)
+        self.logit_gain = float(getattr(self.teacher_cfg, "logit_gain", 1.0))
         # dedicated student-side episodic memory (keys=student mu) to avoid mixing representations
         self.student_mem_cfg = MemoryCfg(min_sim=0.12, logit_scale=3.0)
         self.student_mem = EpisodicMemory(r=self.r, V=self.V, cfg=self.student_mem_cfg, seed=777 + seed)
@@ -1651,6 +1682,7 @@ class SpiralV9:
         if teacher_state is not None:
             eng.teacher.load_state(teacher_state)
             eng.teacher_cfg = eng.teacher.cfg
+            eng.logit_gain = float(getattr(eng.teacher_cfg, "logit_gain", eng.logit_gain))
         # restore student episodic memory (keys=student mu)
         if student_mem_cfg_state is not None:
             eng.student_mem_cfg = MemoryCfg(**student_mem_cfg_state)
@@ -1688,7 +1720,7 @@ class SpiralV9:
         tokens = prompt_ids.astype(np.int64).reshape(1, -1)
         eos_id = getattr(self.tokenizer, "eos_id", 3)
         for _ in range(max_new_tokens):
-            logits, aux = self.student.forward(tokens)
+            logits, aux = self.student.forward(tokens, logit_gain=self.logit_gain)
             # memory boost in logit-space
             if use_memory and hasattr(self, "student_mem_cfg") and self.student_mem_cfg.enable and hasattr(self, "student_mem"):
                 # gentle decay per token generation (optional, feels nice)
@@ -1752,7 +1784,7 @@ class SpiralV9:
         total_loss = 0.0; total = 0; correct = 0
         for start in range(0, ctxs.shape[0], batch):
             ctx_b = ctxs[start:start+batch]; y_b = ys[start:start+batch]
-            logits, _ = self.student.forward(ctx_b)
+            logits, _ = self.student.forward(ctx_b, logit_gain=self.logit_gain)
             p = softmax_rows(logits)
             nll = -np.log(np.maximum(p[np.arange(y_b.shape[0]), y_b], 1e-12))
             total_loss += float(nll.sum())
@@ -1790,13 +1822,19 @@ class SpiralV9:
                                                                       bos_id=bos_id, eos_id=eos_id,
                                                                       max_windows=cfg.max_eval_windows, rng=eval_rng)
         # initial keepk from teacher suggestion
-        logits_dummy, Ts_dummy, mv_dummy, meta = self.teacher.forward_batch(np.zeros((1, cfg.ctx_len), dtype=np.int64))
+        gain_requested = float(getattr(cfg, "logit_gain", self.logit_gain))
+
+        logits_dummy, Ts_dummy, mv_dummy, meta = self.teacher.forward_batch(np.zeros((1, cfg.ctx_len), dtype=np.int64),
+                                                                            logit_gain=gain_requested)
+        gain_used = float(meta.get("logit_gain_used", gain_requested))
+        self.logit_gain = gain_used
         keepk = np.clip(meta["keepk_suggest"], 2, self.student.cfg.k).astype(np.int32)
         self.student.set_keepk_layerwise(keepk)
         assert self.student.B.shape == (self.student.cfg.r, self.V), "student B shape mismatch with cfg/V"
 
         for step in range(cfg.steps):
             Bn = cfg.batch
+            gain = float(self.logit_gain)
             if train_tokens is None:
                 ctx, y = sample_batch_bigram(self.P, ctx_len=cfg.ctx_len, B=Bn, rng=rng)
             else:
@@ -1805,10 +1843,13 @@ class SpiralV9:
             embed_prev = self.student.embed.W.copy()
 
             # teacher
-            t_logits, Ts, meanVars, meta = self.teacher.forward_batch(ctx, targets=y, update_memory=True)
+            t_logits, Ts, meanVars, meta = self.teacher.forward_batch(ctx, targets=y, update_memory=True,
+                                                                      logit_gain=gain)
+            gain_used = float(meta.get("logit_gain_used", gain))
+            self.logit_gain = gain_used
 
             # student forward
-            s_logits, aux = self.student.forward(ctx)
+            s_logits, aux = self.student.forward(ctx, logit_gain=gain_used)
 
             # --- student_mem wrong-learning (メモリだけ自己修正) ---
             if self.student_mem_cfg.enable and self.student_mem.size > 0:
@@ -2019,6 +2060,7 @@ def demo(args=None):
     p.add_argument("--kl_var_alpha", type=float, default=2.0, help="strength of KL downweighting for uncertain teacher samples")
     p.add_argument("--kl_min_w", type=float, default=0.10, help="minimum KL weight per sample")
     p.add_argument("--kl_max_w", type=float, default=1.00, help="maximum KL weight per sample")
+    p.add_argument("--logit_gain", type=float, default=-1.0, help="multiply logits before softmax; <=0 enables auto gain based on logit std")
     p.add_argument("--trace_every", type=int, default=0, help="enable X-ray tracing every N steps (0 to disable)")
     p.add_argument("--trace_k", type=int, default=8, help="top-k candidates to show in trace mode")
     p.add_argument("--rag_m", type=int, default=8, help="top-m RAG sources to fuse from n-gram prior")
@@ -2052,7 +2094,7 @@ def demo(args=None):
     if tokenizer is not None:
         vocab_override = max(vocab_override, tokenizer.vocab_size)
 
-    teacher_cfg = TeacherCfg(rag_m=parsed.rag_m, rag_w=parsed.rag_w)
+    teacher_cfg = TeacherCfg(rag_m=parsed.rag_m, rag_w=parsed.rag_w, logit_gain=parsed.logit_gain)
 
     if parsed.load_path:
         eng = SpiralV9.load(parsed.load_path)
@@ -2087,7 +2129,7 @@ def demo(args=None):
                        trace_every=parsed.trace_every, trace_k=parsed.trace_k,
                        lr_k_stab=0.02, lr_k_expl=0.01,
                        keepk_boost=1, rho_boost=0.0, backprop_T=True, T_grad_scale=0.1,
-                       data_path=parsed.data_path)
+                       data_path=parsed.data_path, logit_gain=parsed.logit_gain)
         logs = eng.train(cfg, data_tokens=data_tokens)
         if logs and parsed.log_path:
             with open(parsed.log_path, "w", encoding="utf-8") as f:
