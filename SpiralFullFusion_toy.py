@@ -668,13 +668,13 @@ class MemoryCfg:
     retrieve_k: int = 16         # retrieve top-k nearest entries
     sim_temp: float = 0.07       # softmax temperature for neighbor weighting
     min_sim: float = 0.20        # if best similarity < min_sim -> don't use memory
-    logit_scale: float = 2.5     # how strongly memory distribution boosts logits
+    logit_scale: float = 1.5     # how strongly memory distribution boosts logits
     decay: float = 0.9995        # global strength decay per teacher.forward_batch call
-    touch_alpha: float = 0.05    # strengthen retrieved entries
+    touch_alpha: float = 0.025   # strengthen retrieved entries
     max_strength: float = 3.0
 
     # --- negative reinforcement ---
-    punish_alpha: float = 0.10      # weaken factor
+    punish_alpha: float = 0.05      # weaken factor
     reward_margin: float = 0.002    # improvement threshold for reward
     punish_margin: float = 0.002    # degradation threshold for punishment
     gain: float = 6.0               # scale reward/punish with magnitude
@@ -1583,6 +1583,9 @@ class SpiralV9:
         self.teacher = SpiralTeacher(V, d, H, L, r, self.P, self.teacher_cfg, seed=42 + seed)
         cfg = student_cfg or StudentCfg(L=max(4, L), d=d, k=max(16, d // 4), V=V, r=r, seed=123 + seed)
         self.student = StudentV9(cfg, self.teacher.B)
+        # dedicated student-side episodic memory (keys=student mu) to avoid mixing representations
+        self.student_mem_cfg = MemoryCfg(min_sim=0.12, logit_scale=3.0)
+        self.student_mem = EpisodicMemory(r=self.r, V=self.V, cfg=self.student_mem_cfg, seed=777 + seed)
         self.tokenizer: Optional[SpiralTokenizer] = None
 
     # ------------------ persistence + inference ------------------
@@ -1594,6 +1597,8 @@ class SpiralV9:
             student_state=self.student.state_dict(),
             teacher_meta=dict(V=self.V, vocab_size=self.V, d=self.d, H=self.H, L=self.L, r=self.r, seed=self.seed),
             teacher_state=self.teacher.state_dict(),
+            student_mem_cfg=asdict(getattr(self, "student_mem_cfg", MemoryCfg())),
+            student_mem_state=(self.student_mem.state_dict() if hasattr(self, "student_mem") else None),
         )
         if self.tokenizer is not None:
             state["tokenizer_state"] = self.tokenizer.state_dict()
@@ -1616,6 +1621,21 @@ class SpiralV9:
             teacher_state = teacher_raw[0] if isinstance(teacher_raw, np.ndarray) else teacher_raw
             if hasattr(teacher_state, "item") and not isinstance(teacher_state, dict):
                 teacher_state = teacher_state.item()
+        student_mem_cfg_state = None
+        if "student_mem_cfg" in data:
+            smc_raw = data["student_mem_cfg"]
+            smc = smc_raw[0] if isinstance(smc_raw, np.ndarray) else smc_raw
+            if hasattr(smc, "item") and not isinstance(smc, dict):
+                smc = smc.item()
+            if isinstance(smc, dict):
+                student_mem_cfg_state = smc
+        student_mem_state = None
+        if "student_mem_state" in data:
+            sms_raw = data["student_mem_state"]
+            sms = sms_raw[0] if isinstance(sms_raw, np.ndarray) else sms_raw
+            if hasattr(sms, "item") and not isinstance(sms, dict):
+                sms = sms.item()
+            student_mem_state = sms
         cfg = StudentCfg(**student_state["cfg"])
         V_meta = meta.get("vocab_size", meta.get("V", cfg.V))
         V = V_meta; d = meta.get("d", cfg.d); H = meta.get("H", 4); L = meta.get("L", cfg.L); r = meta.get("r", cfg.r)
@@ -1625,6 +1645,14 @@ class SpiralV9:
         if teacher_state is not None:
             eng.teacher.load_state(teacher_state)
             eng.teacher_cfg = eng.teacher.cfg
+        # restore student episodic memory (keys=student mu)
+        if student_mem_cfg_state is not None:
+            eng.student_mem_cfg = MemoryCfg(**student_mem_cfg_state)
+        else:
+            eng.student_mem_cfg = MemoryCfg(min_sim=0.12, logit_scale=3.0)
+        eng.student_mem = EpisodicMemory(r=eng.r, V=eng.V, cfg=eng.student_mem_cfg, seed=777 + base_seed)
+        if student_mem_state is not None:
+            eng.student_mem.load_state(student_mem_state)
         if eng.student.cfg.V != eng.V:
             raise ValueError(f"Loaded student vocab ({eng.student.cfg.V}) does not match engine V ({eng.V})")
         # assert shapes before sharing projection
@@ -1656,13 +1684,15 @@ class SpiralV9:
         for _ in range(max_new_tokens):
             logits, aux = self.student.forward(tokens)
             # memory boost in logit-space
-            if use_memory and hasattr(self.teacher, "mem_cfg") and self.teacher.mem_cfg.enable and hasattr(self.teacher, "mem"):
+            if use_memory and hasattr(self, "student_mem_cfg") and self.student_mem_cfg.enable and hasattr(self, "student_mem"):
                 # gentle decay per token generation (optional, feels nice)
-                self.teacher.mem.decay()
+                self.student_mem.decay()
                 mu_q = aux["mu"][0]  # [r]
-                inds_m, vals_m, info_m = self.teacher.mem.retrieve(mu_q, scale=mem_scale)
+                inds_m, vals_m, info_m = self.student_mem.retrieve(mu_q, scale=mem_scale)
                 if inds_m is not None and inds_m.size > 0:
                     logits[0, inds_m] += vals_m
+                    # light reinforcement during generation
+                    self.student_mem.touch(info_m.get("mem_idx", np.zeros((0,), dtype=np.int64)), alpha=0.01)
 
             logits = logits / max(temperature, 1e-4)
             probs = softmax_rows(logits)
@@ -1774,18 +1804,44 @@ class SpiralV9:
             # student forward
             s_logits, aux = self.student.forward(ctx)
 
+            # --- student_mem wrong-learning (メモリだけ自己修正) ---
+            if self.student_mem_cfg.enable and self.student_mem.size > 0:
+                Teval = 1.0
+                p_before = softmax_rows((s_logits / Teval).astype(np.float32))  # [B,V]
+                for b in range(Bn):
+                    mu_q = aux["mu"][b]
+                    inds_m, vals_m, info_m = self.student_mem.retrieve(mu_q)
+                    if inds_m is None or inds_m.size == 0:
+                        continue
+                    logits_after = s_logits[b].copy()
+                    logits_after[inds_m] += vals_m
+                    p_after = softmax_rows((logits_after[None, :] / Teval).astype(np.float32))[0]
+
+                    yb = int(y[b])
+                    imp = float(p_after[yb] - p_before[b, yb])
+
+                    mem_idx = info_m.get("mem_idx", np.zeros((0,), dtype=np.int64))
+                    if imp > float(self.student_mem_cfg.reward_margin):
+                        alpha = float(self.student_mem_cfg.touch_alpha) * (1.0 + float(self.student_mem_cfg.gain) * imp)
+                        self.student_mem.touch(mem_idx, alpha=alpha)
+                    elif imp < -float(self.student_mem_cfg.punish_margin):
+                        alpha = float(self.student_mem_cfg.punish_alpha) * (1.0 + float(self.student_mem_cfg.gain) * (-imp))
+                        self.student_mem.penalize(mem_idx, alpha=alpha)
+                    else:
+                        self.student_mem.touch(mem_idx, alpha=0.25 * float(self.student_mem_cfg.touch_alpha))
+
             # ---- ALSO store episodes keyed by STUDENT mu (so generate() can retrieve them) ----
-            if hasattr(self.teacher, "mem_cfg") and self.teacher.mem_cfg.enable and hasattr(self.teacher, "mem"):
+            if hasattr(self, "student_mem_cfg") and self.student_mem_cfg.enable and hasattr(self, "student_mem"):
                 q = softmax_rows(t_logits / np.maximum(Ts, 1e-6))  # teacher dist used as value
                 for b in range(Bn):
-                    if self.teacher.mem._rng.random() > float(self.teacher.mem_cfg.add_rate):
+                    if self.student_mem._rng.random() > float(self.student_mem_cfg.add_rate):
                         continue
                     yb = int(y[b])
                     py = float(q[b, yb])
                     Tb = float(Ts[b, 0])
-                    if (py >= float(self.teacher.mem_cfg.add_prob_thr)) and (Tb <= float(self.teacher.mem_cfg.add_T_thr)):
-                        idx_m, val_m = self.teacher.mem.build_payload_from_probs(q[b], yb)
-                        self.teacher.mem.add(aux["mu"][b], idx_m, val_m)
+                    if (py >= float(self.student_mem_cfg.add_prob_thr)) and (Tb <= float(self.student_mem_cfg.add_T_thr)):
+                        idx_m, val_m = self.student_mem.build_payload_from_probs(q[b], yb)
+                        self.student_mem.add(aux["mu"][b], idx_m, val_m)
 
             # student T from Sigma
             T_S, meanVar_S, var_top_S = T_from_Sigma(self.student.B, aux["Sigma"], s_logits,
