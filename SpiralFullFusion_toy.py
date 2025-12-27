@@ -1361,9 +1361,10 @@ class StudentV9:
             dh = self.blocks[l].backward(dh)
         self.embed.backward(dh)
 
-    def step(self):
+    def step(self, grad_layers: Optional[np.ndarray] = None):
         # Adapt the effective LR to keep gradient magnitudes near a target.
-        g_rms = float(np.mean(self.grad_rms()))
+        gl = grad_layers if grad_layers is not None else self.grad_rms()
+        g_rms = float(np.mean(gl))
         g_scale = float(np.clip(self.cfg.grad_target / max(g_rms, 1e-6), 0.2, 10.0))
         base = self.cfg.base_lr * g_scale
         etas = self.u.eta(base)
@@ -1873,25 +1874,14 @@ class SpiralV9:
                                  Tmin=cfg.Tmin, Tmax=cfg.Tmax)  # [B,r]
                 dSigma_T = (cfg.T_grad_scale * dC) * dTdS       # [B,r]
 
-            # backward + step
+            # backward + hazard using grad stats before the optimizer resets them
             self.student.backward(dlogits, aux, dSigma_from_T=dSigma_T)
             embed_gnorm = float(np.linalg.norm(self.student.embed.dW))
-            etas, g_rms, g_scale = self.student.step()
-            embed_delta = float(np.linalg.norm(self.student.embed.W - embed_prev))
-
-            # reliability → rho nudging
-            xz, stab, expl = self.teacher.rel.layer_stats(stab_thr=1.0)
-            for l in range(self.student.cfg.L):
-                # map L mismatch (teacher L vs student L): clamp index
-                l_t = min(l, self.teacher.L - 1)
-                stab_ratio = float(np.mean(stab[l_t])); expl_ratio = float(np.mean(expl[l_t]))
-                self.student.u.rho[l] += cfg.lr_k_expl * expl_ratio - cfg.lr_k_stab * stab_ratio
-                self.student.u.rho[l] = float(np.clip(self.student.u.rho[l], -2.0, 2.0))
+            grad_layers = self.student.grad_rms()
 
             # partial optimization (hazard)
             hazard_teach = meta["layer_hazard"].copy()  # [L_teach] from teacher reliability
             hazard_grad = hazard_teach.copy()           # gradient-derived proxy for control
-            grad_layers = self.student.grad_rms()
             for l_t in range(self.teacher.L):
                 idx = min(l_t, grad_layers.shape[0]-1)
                 hazard_grad[l_t] = float(np.clip(grad_layers[idx] / 0.02, 0.0, 1.0))
@@ -1909,6 +1899,18 @@ class SpiralV9:
             self.student.u.rho = np.clip(self.student.u.rho, -2.0, 2.0)
             self.student.u.rho *= 0.999
             self.student.set_keepk_layerwise(keepk_new)
+
+            etas, g_rms, g_scale = self.student.step(grad_layers=grad_layers)
+            embed_delta = float(np.linalg.norm(self.student.embed.W - embed_prev))
+
+            # reliability → rho nudging
+            xz, stab, expl = self.teacher.rel.layer_stats(stab_thr=1.0)
+            for l in range(self.student.cfg.L):
+                # map L mismatch (teacher L vs student L): clamp index
+                l_t = min(l, self.teacher.L - 1)
+                stab_ratio = float(np.mean(stab[l_t])); expl_ratio = float(np.mean(expl[l_t]))
+                self.student.u.rho[l] += cfg.lr_k_expl * expl_ratio - cfg.lr_k_stab * stab_ratio
+                self.student.u.rho[l] = float(np.clip(self.student.u.rho[l], -2.0, 2.0))
 
             # logging
             rag_w = self.teacher.rag_src_weight
