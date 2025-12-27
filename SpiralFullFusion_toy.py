@@ -659,7 +659,7 @@ class UncertaintyLR:
 
 @dataclass
 class StudentCfg:
-    L: int = 4; d: int = 96; k: int = 24; V: int = 128; r: int = 24
+    L: int = 4; d: int = 96; k: int = 24; V: int = 128; r: int = 64
     base_lr: float = 5e-2; head_lr: float = 5e-2; emb_lr: float = 5e-2
     grad_target: float = 0.1
     seed: int = 123
@@ -819,7 +819,7 @@ class TrainCfg:
     backprop_T: bool = True; T_grad_scale: float = 0.1
 
 class SpiralV9:
-    def __init__(self, V: int = 128, d: int = 96, H: int = 4, L: int = 4, r: int = 24, seed: int = 0):
+    def __init__(self, V: int = 128, d: int = 96, H: int = 4, L: int = 4, r: int = 64, seed: int = 0):
         self.V, self.d, self.H, self.L, self.r = V, d, H, L, r
         self.P = make_bigram(V, seed=7)
         self.teacher = SpiralTeacher(V, d, H, L, r, self.P, TeacherCfg(), seed=42)
@@ -883,15 +883,16 @@ class SpiralV9:
                 self.student.u.rho[l] = float(np.clip(self.student.u.rho[l], -2.0, 2.0))
 
             # partial optimization (hazard)
-            hazard = meta["layer_hazard"].copy()  # [L_teach]
+            hazard_teach = meta["layer_hazard"].copy()  # [L_teach] from teacher reliability
+            hazard_grad = hazard_teach.copy()           # gradient-derived proxy for control
             grad_layers = self.student.grad_rms()
             for l_t in range(self.teacher.L):
                 idx = min(l_t, grad_layers.shape[0]-1)
-                hazard[l_t] = float(np.clip(grad_layers[idx] / 0.2, 0.0, 1.0))
+                hazard_grad[l_t] = float(np.clip(grad_layers[idx] / 0.2, 0.0, 1.0))
             keepk_new = self.student._keepk.copy()
             for l in range(self.student.cfg.L):
                 l_t = min(l, self.teacher.L - 1)
-                if hazard[l_t] > self.teacher.cfg.danger_rho_thr:
+                if hazard_grad[l_t] > self.teacher.cfg.danger_rho_thr:
                     keepk_new[l] = int(np.clip(keepk_new[l] + cfg.keepk_boost, 2, self.student.cfg.k))
                     self.student.u.rho[l] += cfg.rho_boost  # reduce LR
             # re-clamp after hazard nudging to prevent runaway shrinkage of learning rate
@@ -907,15 +908,17 @@ class SpiralV9:
                              eta0=float(etas[0]), rho0=float(self.student.u.rho[0]), keepk0=int(self.student._keepk[0]),
                              grad_rms=float(g_rms), grad_scale=float(g_scale),
                              keepk_all=self.student._keepk.tolist(), rho_all=self.student.u.rho.tolist(),
-                             hazard=float(hazard.mean()), hazard_all=meta["layer_hazard"].tolist(),
+                             hazard=float(hazard_grad.mean()),
+                             hazard_teach=float(hazard_teach.mean()), hazard_teach_all=hazard_teach.tolist(),
+                             hazard_grad=float(hazard_grad.mean()), hazard_grad_all=hazard_grad.tolist(),
                              embed_dnorm=embed_delta, embed_gnorm=embed_gnorm,
                              **rag_stats))
             if (step+1) % 5 == 0:
                 print(f"[{step+1:03d}] CE={ce:.4f} KL={kl:.4f} ECE={logs[-1]['ECE']:.4f} | "
                       f"T={T_S.mean():.3f} var~={meanVars.mean():.4f} | η0={etas[0]:.4e} ρ0={self.student.u.rho[0]:+.3f} keepk0={self.student._keepk[0]} | "
-                      f"g_rms={g_rms:.4e} g_scale={g_scale:.2f} | hazard~{hazard.mean():.3f} | "
+                      f"g_rms={g_rms:.4e} g_scale={g_scale:.2f} | hazard_t~{hazard_teach.mean():.3f} hazard_g~{hazard_grad.mean():.3f} | "
                       f"keepk={self.student._keepk.tolist()} rho={self.student.u.rho.tolist()} "
-                      f"hazards={meta['layer_hazard'].tolist()} embed_dnorm={embed_delta:.4e} embed_gnorm={embed_gnorm:.4e} | "
+                      f"hazards_t={hazard_teach.tolist()} hazards_g={hazard_grad.tolist()} embed_dnorm={embed_delta:.4e} embed_gnorm={embed_gnorm:.4e} | "
                       f"rag_w[min/mean/max]={rag_stats['rag_min']:.3f}/{rag_stats['rag_mean']:.3f}/{rag_stats['rag_max']:.3f}")
         return logs
 
@@ -932,10 +935,10 @@ def demo(args=None):
     p.add_argument("--d", type=int, default=96)
     p.add_argument("--H", type=int, default=4)
     p.add_argument("--L", type=int, default=4)
-    p.add_argument("--r", type=int, default=24)
+    p.add_argument("--r", type=int, default=64)
     p.add_argument("--data_path", type=str, default=None, help="optional npy file with token ids")
     p.add_argument("--text_path", type=str, default=None, help="optional utf-8 text file to train tokenizer + dataset")
-    p.add_argument("--tok_vocab", type=int, default=1024, help="tokenizer vocab size target when using text_path")
+    p.add_argument("--tok_vocab", type=int, default=256, help="tokenizer vocab size target when using text_path")
     p.add_argument("--tok_min_freq", type=int, default=2, help="minimum pair frequency for BPE merges")
     p.add_argument("--tok_lowercase", action="store_true", help="lowercase text before tokenization")
     p.add_argument("--tok_no_bos", action="store_true", help="disable adding BOS during tokenization")
