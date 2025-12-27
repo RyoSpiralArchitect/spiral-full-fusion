@@ -1270,6 +1270,13 @@ class SpiralV9:
                     eval_valid = self._eval_split(eval_valid_ctx, eval_valid_y, cfg.batch)
                     if eval_valid is not None:
                         log_entry["ppl_valid"], log_entry["acc_valid"] = eval_valid
+                if eval_train is not None or eval_valid_ctx is not None:
+                    msg = [f"[eval step {step+1}]"]
+                    if eval_train is not None:
+                        msg.append(f"train ppl={log_entry.get('ppl_train', float('nan')):.3f} acc={log_entry.get('acc_train', float('nan')):.3f}")
+                    if eval_valid is not None:
+                        msg.append(f"valid ppl={log_entry.get('ppl_valid', float('nan')):.3f} acc={log_entry.get('acc_valid', float('nan')):.3f}")
+                    print(" | ".join(msg))
             logs.append(log_entry)
             if (step+1) % 5 == 0:
                 print(f"[{step+1:03d}] CE={ce:.4f} KL={kl:.4f} ECE={logs[-1]['ECE']:.4f} | "
@@ -1285,6 +1292,7 @@ class SpiralV9:
 # ------------------------------
 def demo(args=None):
     import argparse
+    import json
     def _looks_like_id_list(s: str) -> bool:
         parts = [p.strip() for p in s.split(",") if p.strip() != ""]
         if not parts:
@@ -1322,6 +1330,7 @@ def demo(args=None):
     p.add_argument("--top_p", type=float, default=0.9, help="top-p nucleus threshold for sampling")
     p.add_argument("--rng_seed", type=int, default=0, help="seed for sampler reproducibility")
     p.add_argument("--top_k", type=int, default=None, help="optional top-k cutoff before top-p (nucleus) sampling")
+    p.add_argument("--log_path", type=str, default=None, help="optional JSON path to save training logs")
     parsed = p.parse_args(args=args)
 
     data_tokens = None
@@ -1333,6 +1342,7 @@ def demo(args=None):
         data_vmax = int(data_tokens.max()) + 1 if data_tokens.size > 0 else 0
         vocab_override = max(vocab_override, data_vmax)
         data_tokens = np.clip(data_tokens, 0, vocab_override - 1)
+        print(f"[data] Loaded tokens from {parsed.data_path} (N={data_tokens.size}, vmax={data_vmax})")
     if parsed.text_path and data_tokens is None:
         with open(parsed.text_path, "r", encoding="utf-8") as f:
             text = f.read()
@@ -1344,6 +1354,7 @@ def demo(args=None):
         data_tokens = tokenizer.encode_corpus(text)
         vocab_override = tokenizer.vocab_size
         data_tokens = np.clip(data_tokens, 0, vocab_override - 1)
+        print(f"[tokenizer] Trained tokenizer (vocab={tokenizer.vocab_size}) from {parsed.text_path}; corpus tokens={data_tokens.size}")
     if tokenizer is not None:
         vocab_override = max(vocab_override, tokenizer.vocab_size)
 
@@ -1373,6 +1384,10 @@ def demo(args=None):
                        keepk_boost=2, rho_boost=0.0, backprop_T=True, T_grad_scale=0.1,
                        data_path=parsed.data_path)
         logs = eng.train(cfg, data_tokens=data_tokens)
+        if logs and parsed.log_path:
+            with open(parsed.log_path, "w", encoding="utf-8") as f:
+                json.dump(logs, f, ensure_ascii=False, indent=2)
+            print(f"[logs] Saved training logs to {parsed.log_path}")
         if parsed.save_path:
             eng.save_weights(parsed.save_path)
             print(f"Saved weights to {parsed.save_path}")
