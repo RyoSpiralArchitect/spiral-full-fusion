@@ -673,6 +673,12 @@ class MemoryCfg:
     touch_alpha: float = 0.05    # strengthen retrieved entries
     max_strength: float = 3.0
 
+    # --- negative reinforcement ---
+    punish_alpha: float = 0.10      # weaken factor
+    reward_margin: float = 0.002    # improvement threshold for reward
+    punish_margin: float = 0.002    # degradation threshold for punishment
+    gain: float = 6.0               # scale reward/punish with magnitude
+
     # insertion gating (only during training when targets are available)
     add_rate: float = 0.50       # subsample insertions (0..1)
     add_prob_thr: float = 0.35   # insert only if teacher prob(y) >= thr
@@ -718,12 +724,23 @@ class EpisodicMemory:
         self.strength[:self.size] *= float(self.cfg.decay)
         self.strength[:self.size] = np.clip(self.strength[:self.size], 0.0, float(self.cfg.max_strength))
 
-    def touch(self, mem_idx: np.ndarray):
+    def touch(self, mem_idx: np.ndarray, alpha: Optional[float] = None):
         if mem_idx is None or mem_idx.size == 0:
             return
         mem_idx = mem_idx.astype(np.int64)
+        inc = float(self.cfg.touch_alpha if alpha is None else alpha)
         s = self.strength[mem_idx]
-        s = s + float(self.cfg.touch_alpha)
+        s = s + inc
+        self.strength[mem_idx] = np.clip(s, 0.0, float(self.cfg.max_strength))
+        self.used[mem_idx] += 1
+
+    def penalize(self, mem_idx: np.ndarray, alpha: Optional[float] = None):
+        if mem_idx is None or mem_idx.size == 0:
+            return
+        mem_idx = mem_idx.astype(np.int64)
+        dec = float(self.cfg.punish_alpha if alpha is None else alpha)
+        s = self.strength[mem_idx]
+        s = s - dec
         self.strength[mem_idx] = np.clip(s, 0.0, float(self.cfg.max_strength))
         self.used[mem_idx] += 1
 
@@ -920,6 +937,8 @@ class SpiralTeacher:
         # memory stats
         mem_used = 0
         mem_maxsim_sum = 0.0
+        mem_rewarded = 0
+        mem_punished = 0
 
         if getattr(self, "mem_cfg", None) is not None and self.mem_cfg.enable:
             self.mem.decay()
@@ -969,23 +988,47 @@ class SpiralTeacher:
 
             # ---- episodic memory retrieve (kNN-RAG) ----
             logits_pre_mem = logits_b.copy() if (update_memory and targets is not None) else None
-            mu_key = mu_post.copy()  # store/retrieve key BEFORE memory injection (avoid self-reinforcement)
+            mu_key = mu_post.copy()  # query key (rank space)
 
             if hasattr(self, "mem_cfg") and self.mem_cfg.enable and hasattr(self, "mem"):
                 inds_m, vals_m, info_m = self.mem.retrieve(mu_key)
                 if inds_m is not None and inds_m.size > 0:
+                    # apply sparse logit boost
                     logits_b[inds_m] += vals_m
 
-                    # optional: rank-space injection like n-gram (keeps internal story coherent)
+                    # optional: rank-space injection (keeps internal story coherent)
                     mu_dm = self._rag_rank_mu_delta(inds_m, vals_m)
                     if mu_dm is not None:
                         mu_post = (mu_post + mu_dm).astype(np.float32)
                         logits_b = self.fusers[-1].logits_from_mu(mu_post)
 
-                    # strengthen retrieved memories
                     mem_used += 1
                     mem_maxsim_sum += float(info_m.get("max_sim", 0.0))
-                    self.mem.touch(info_m.get("mem_idx", np.zeros((0,), dtype=np.int64)))
+                    mem_idx = info_m.get("mem_idx", np.zeros((0,), dtype=np.int64))
+
+                    # ---- wrong-learning (negative reinforcement) ----
+                    if update_memory and targets is not None and logits_pre_mem is not None:
+                        yb = int(targets[b])
+                        # evaluate effect using fixed Teval=1.0 (isolates memory effect)
+                        Teval = 1.0
+                        p_before = softmax_rows((logits_pre_mem[None, :] / Teval).astype(np.float32))[0]
+                        p_after  = softmax_rows((logits_b[None, :] / Teval).astype(np.float32))[0]
+                        imp = float(p_after[yb] - p_before[yb])  # improvement in p(y)
+
+                        if imp > float(self.mem_cfg.reward_margin):
+                            alpha = float(self.mem_cfg.touch_alpha) * (1.0 + float(self.mem_cfg.gain) * imp)
+                            self.mem.touch(mem_idx, alpha=alpha)
+                            mem_rewarded += 1
+                        elif imp < -float(self.mem_cfg.punish_margin):
+                            alpha = float(self.mem_cfg.punish_alpha) * (1.0 + float(self.mem_cfg.gain) * (-imp))
+                            self.mem.penalize(mem_idx, alpha=alpha)
+                            mem_punished += 1
+                        else:
+                            # neutral: tiny touch (optional)
+                            self.mem.touch(mem_idx, alpha=0.25 * float(self.mem_cfg.touch_alpha))
+                    else:
+                        # no targets -> "use strengthens memory" only
+                        self.mem.touch(mem_idx)
 
             # variance on top-k
             var_logits = self.fusers[-1].variance_full_logits(var_post)  # [V]
@@ -1028,10 +1071,12 @@ class SpiralTeacher:
             decay = np.exp(-1.5 * vals)  # higher attribution ⇒ stronger decay
             self.rag_src_weight[keys] = np.clip(self.rag_src_weight[keys] * decay, 0.2, 1.0)
 
-        mem_size = int(getattr(self, "mem", None).size) if hasattr(self, "mem") else 0
+        mem_size = int(self.mem.size) if (hasattr(self, "mem") and self.mem is not None) else 0
         mem_used_frac = float(mem_used) / max(1, tokens_batch.shape[0])
         mem_mean_maxsim = float(mem_maxsim_sum) / max(1, mem_used) if mem_used > 0 else 0.0
         mem_mean_strength = float(np.mean(self.mem.strength[:self.mem.size])) if (hasattr(self, "mem") and self.mem.size > 0) else 0.0
+        mem_reward_frac = float(mem_rewarded) / max(1, mem_used)
+        mem_punish_frac = float(mem_punished) / max(1, mem_used)
 
         meta = dict(
             meanVar=float(meanVars.mean()),
@@ -1041,6 +1086,8 @@ class SpiralTeacher:
             mem_used_frac=mem_used_frac,
             mem_mean_maxsim=mem_mean_maxsim,
             mem_mean_strength=mem_mean_strength,
+            mem_reward_frac=mem_reward_frac,
+            mem_punish_frac=mem_punish_frac,
         )
         return logits, Ts, meanVars, meta
 
@@ -1600,12 +1647,23 @@ class SpiralV9:
 
     def generate(self, prompt_ids: np.ndarray, max_new_tokens: int = 32,
                  temperature: float = 1.0, top_p: float = 0.9, top_k: Optional[int] = None,
-                 rng_seed: Optional[int] = None) -> np.ndarray:
+                 rng_seed: Optional[int] = None,
+                 use_memory: bool = True,
+                 mem_scale: Optional[float] = None) -> np.ndarray:
         rng = np.random.default_rng(rng_seed)
         tokens = prompt_ids.astype(np.int64).reshape(1, -1)
         eos_id = getattr(self.tokenizer, "eos_id", 3)
         for _ in range(max_new_tokens):
-            logits, _ = self.student.forward(tokens)
+            logits, aux = self.student.forward(tokens)
+            # memory boost in logit-space
+            if use_memory and hasattr(self.teacher, "mem_cfg") and self.teacher.mem_cfg.enable and hasattr(self.teacher, "mem"):
+                # gentle decay per token generation (optional, feels nice)
+                self.teacher.mem.decay()
+                mu_q = aux["mu"][0]  # [r]
+                inds_m, vals_m, info_m = self.teacher.mem.retrieve(mu_q, scale=mem_scale)
+                if inds_m is not None and inds_m.size > 0:
+                    logits[0, inds_m] += vals_m
+
             logits = logits / max(temperature, 1e-4)
             probs = softmax_rows(logits)
             p = probs[0]
@@ -1627,10 +1685,13 @@ class SpiralV9:
 
     def generate_text(self, prompt: str, tokenizer: SpiralTokenizer, max_new_tokens: int = 32,
                       temperature: float = 1.0, top_p: float = 0.9, top_k: Optional[int] = None,
-                      rng_seed: Optional[int] = None) -> str:
+                      rng_seed: Optional[int] = None,
+                      use_memory: bool = True,
+                      mem_scale: Optional[float] = None) -> str:
         ids = tokenizer.encode(prompt, add_special_tokens=True)
         gen = self.generate(ids, max_new_tokens=max_new_tokens,
-                            temperature=temperature, top_p=top_p, top_k=top_k, rng_seed=rng_seed)
+                            temperature=temperature, top_p=top_p, top_k=top_k, rng_seed=rng_seed,
+                            use_memory=use_memory, mem_scale=mem_scale)
         return tokenizer.decode(gen)
 
     def _train_valid_split(self, tokens: np.ndarray, ctx_len: int, valid_frac: float,
@@ -1713,6 +1774,19 @@ class SpiralV9:
             # student forward
             s_logits, aux = self.student.forward(ctx)
 
+            # ---- ALSO store episodes keyed by STUDENT mu (so generate() can retrieve them) ----
+            if hasattr(self.teacher, "mem_cfg") and self.teacher.mem_cfg.enable and hasattr(self.teacher, "mem"):
+                q = softmax_rows(t_logits / np.maximum(Ts, 1e-6))  # teacher dist used as value
+                for b in range(Bn):
+                    if self.teacher.mem._rng.random() > float(self.teacher.mem_cfg.add_rate):
+                        continue
+                    yb = int(y[b])
+                    py = float(q[b, yb])
+                    Tb = float(Ts[b, 0])
+                    if (py >= float(self.teacher.mem_cfg.add_prob_thr)) and (Tb <= float(self.teacher.mem_cfg.add_T_thr)):
+                        idx_m, val_m = self.teacher.mem.build_payload_from_probs(q[b], yb)
+                        self.teacher.mem.add(aux["mu"][b], idx_m, val_m)
+
             # student T from Sigma
             T_S, meanVar_S, var_top_S = T_from_Sigma(self.student.B, aux["Sigma"], s_logits,
                                                      T0=cfg.T0, lam=cfg.lam, gamma=cfg.gamma,
@@ -1794,6 +1868,8 @@ class SpiralV9:
                              mem_used_frac=float(meta.get("mem_used_frac", 0.0)),
                              mem_mean_maxsim=float(meta.get("mem_mean_maxsim", 0.0)),
                              mem_mean_strength=float(meta.get("mem_mean_strength", 0.0)),
+                             mem_reward_frac=float(meta.get("mem_reward_frac", 0.0)),
+                             mem_punish_frac=float(meta.get("mem_punish_frac", 0.0)),
                              embed_dnorm=embed_delta, embed_gnorm=embed_gnorm,
                              ce_scale=ce_scale, kl_scale=kl_scale, distil_phase=distil_phase,
                              **rag_stats)
