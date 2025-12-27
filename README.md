@@ -45,3 +45,6 @@ Decode from a saved checkpoint using token IDs:
 ```bash
 python SpiralFullFusion_toy.py --steps 0 --load_path /tmp/spiral_demo.npz --prompt "1,2,3" --max_new_tokens 24 --temperature 1.1 --top_p 0.9
 ```
+
+### Toy-friendly defaults
+- For the cleanest toy behavior, keep `--V 256`, `--tok_vocab 256`, and `--r 64` so the synthetic bigram world and rank head stay aligned.

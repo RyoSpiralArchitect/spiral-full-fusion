@@ -1028,6 +1028,10 @@ class SpiralV9:
         eng.student.load_state(student_state)
         if teacher_state is not None:
             eng.teacher.load_state(teacher_state)
+        # assert shapes before sharing projection
+        assert eng.student.B.shape == eng.teacher.fusers[0].B.shape, "B shape mismatch"
+        assert eng.student.cfg.r == eng.student.B.shape[0], "student r mismatch"
+        assert eng.V == eng.student.B.shape[1], "V mismatch"
         # align teacher logits with loaded student projection (B is shared)
         eng.teacher.B = eng.student.B
         for f in eng.teacher.fusers:
@@ -1044,6 +1048,7 @@ class SpiralV9:
                  temperature: float = 1.0, top_p: float = 0.9, rng_seed: Optional[int] = None) -> np.ndarray:
         rng = np.random.default_rng(rng_seed)
         tokens = prompt_ids.astype(np.int64).reshape(1, -1)
+        eos_id = getattr(self.tokenizer, "eos_id", 3)
         for _ in range(max_new_tokens):
             logits, _ = self.student.forward(tokens)
             logits = logits / max(temperature, 1e-4)
@@ -1061,6 +1066,8 @@ class SpiralV9:
                 keep_p = p[keep]; keep_p = keep_p / np.maximum(keep_p.sum(), EPS)
                 chosen_idx = int(rng.choice(keep, p=keep_p))
             tokens = np.concatenate([tokens, np.array([[chosen_idx]], dtype=np.int64)], axis=1)
+            if chosen_idx == eos_id:
+                break
         return tokens[0]
 
     def generate_text(self, prompt: str, tokenizer: SpiralTokenizer, max_new_tokens: int = 32,
@@ -1171,6 +1178,16 @@ class SpiralV9:
 # ------------------------------
 def demo(args=None):
     import argparse
+    def _looks_like_id_list(s: str) -> bool:
+        parts = [p.strip() for p in s.split(",") if p.strip() != ""]
+        if not parts:
+            return False
+        for p in parts:
+            if p.startswith("-"):
+                p = p[1:]
+            if not p.isdigit():
+                return False
+        return True
     p = argparse.ArgumentParser(description="SpiralFullFusion toy demo")
     p.add_argument("--steps", type=int, default=500)
     p.add_argument("--batch", type=int, default=16)
@@ -1244,7 +1261,7 @@ def demo(args=None):
     # Inference / decoder
     if parsed.prompt is not None:
         rng_seed = parsed.rng_seed
-        prompt_is_ids = parsed.prompt.replace(",", "").strip().isdigit()
+        prompt_is_ids = _looks_like_id_list(parsed.prompt)
         if eng.tokenizer is not None and not prompt_is_ids:
             text = eng.generate_text(parsed.prompt, eng.tokenizer,
                                      max_new_tokens=parsed.max_new_tokens,
