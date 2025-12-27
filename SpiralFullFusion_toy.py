@@ -1435,7 +1435,7 @@ class StudentV9:
         embed_rms = float(np.sqrt(np.mean(self.embed.dW**2))) if self.embed.dW.size > 0 else 0.0
         g_all = np.concatenate([np.array(gl, dtype=np.float32).reshape(-1), np.array([embed_rms], dtype=np.float32)])
         g_rms = float(np.mean(g_all))
-        g_scale = float(np.clip(self.cfg.grad_target / max(g_rms, 1e-6), 0.2, 5.0))
+        g_scale = float(np.clip(self.cfg.grad_target / max(g_rms, 1e-6), 0.02, 5.0))
         base = self.cfg.base_lr * g_scale
         etas = self.u.eta(base)
         for l, blk in enumerate(self.blocks):
@@ -1957,7 +1957,10 @@ class SpiralV9:
                                                                             logit_gain=gain_requested)
         gain_used = float(meta.get("logit_gain_used", gain_requested))
         self.logit_gain = gain_used
-        keepk = np.clip(meta["keepk_suggest"], 2, self.student.cfg.k).astype(np.int32)
+        # map teacher keepk suggestion (2..r) into student range (2..k) to avoid instant saturation
+        kt = meta["keepk_suggest"].astype(np.float32)
+        kk = 2.0 + (kt - 2.0) * (self.student.cfg.k - 2.0) / max(1.0, (self.teacher.r - 2.0))
+        keepk = np.clip(np.round(kk), 2, self.student.cfg.k).astype(np.int32)
         self.student.set_keepk_layerwise(keepk)
         assert self.student.B.shape == (self.student.cfg.r, self.V), "student B shape mismatch with cfg/V"
 
@@ -2056,40 +2059,40 @@ class SpiralV9:
 
             # partial optimization (hazard)
             hazard_teach = meta["layer_hazard"].copy()  # [L_teach] from teacher reliability
+            # hazard_grad scales to per-batch median to avoid saturation
             hazard_grad = hazard_teach.copy()           # gradient-derived proxy for control
+            gref = float(np.median(grad_layers) + 1e-6)
             for l_t in range(self.teacher.L):
                 idx = min(l_t, grad_layers.shape[0]-1)
-                hazard_grad[l_t] = float(np.clip(grad_layers[idx] / cfg.hazard_grad_scale, 0.0, 1.0))
+                g = float(grad_layers[idx])
+                hazard_grad[l_t] = float(np.clip(g / (2.0 * gref), 0.0, 1.0))
             keepk_new = self.student._keepk.copy()
-            keepk_step = max(1, int(round(cfg.keepk_boost)))
             for l in range(self.student.cfg.L):
                 l_t = min(l, self.teacher.L - 1)
                 hg = hazard_grad[l_t]
-                if hg > cfg.hazard_high_thr:
-                    keepk_new[l] = int(np.clip(keepk_new[l] + keepk_step, 2, self.student.cfg.k))
-                    self.student.u.rho[l] += cfg.rho_boost  # reduce LR
-                elif hg < cfg.hazard_low_thr:
-                    keepk_new[l] = int(np.clip(keepk_new[l] - keepk_step, 2, self.student.cfg.k))
+                kmin, kmax = 2, self.student.cfg.k
+                k_target = int(round(kmin + hg * (kmax - kmin)))
+                keepk_new[l] = int(np.clip(round(0.9 * keepk_new[l] + 0.1 * k_target), kmin, kmax))
                 # optional periodic jitter to avoid sticking
                 if cfg.keepk_jitter_every > 0 and ((step + 1) % cfg.keepk_jitter_every == 0):
                     jitter = int(np.clip(cfg.keepk_jitter_mag, 1, self.student.cfg.k))
                     direction = -1 if (step // cfg.keepk_jitter_every) % 2 == 0 else 1
                     keepk_new[l] = int(np.clip(keepk_new[l] + direction * jitter, 2, self.student.cfg.k))
+                # rho nudging tied to hazard to reduce LR when hazard high
+                self.student.u.rho[l] += cfg.rho_boost * (hg - 0.5)
             # re-clamp after hazard nudging to prevent runaway shrinkage of learning rate
             self.student.u.rho = np.clip(self.student.u.rho, -2.0, 2.0)
-            self.student.u.rho *= 0.999
+            self.student.u.rho *= 0.9995
             self.student.set_keepk_layerwise(keepk_new)
 
             etas, g_rms, g_scale = self.student.step(grad_layers=grad_layers)
             embed_delta = float(np.linalg.norm(self.student.embed.W - embed_prev))
 
-            # reliability → rho nudging
-            xz, stab, expl = self.teacher.rel.layer_stats(stab_thr=1.0)
+            # reliability → rho nudging (use grad signal to avoid teacher-constant saturation)
+            g0 = float(np.median(grad_layers) + 1e-6)
             for l in range(self.student.cfg.L):
-                # map L mismatch (teacher L vs student L): clamp index
-                l_t = min(l, self.teacher.L - 1)
-                stab_ratio = float(np.mean(stab[l_t])); expl_ratio = float(np.mean(expl[l_t]))
-                self.student.u.rho[l] += cfg.lr_k_expl * expl_ratio - cfg.lr_k_stab * stab_ratio
+                g = float(grad_layers[min(l, grad_layers.shape[0]-1)])
+                self.student.u.rho[l] += 0.05 * np.tanh((g - g0) / max(0.1, 0.5 * g0))
                 self.student.u.rho[l] = float(np.clip(self.student.u.rho[l], -2.0, 2.0))
 
             # logging
