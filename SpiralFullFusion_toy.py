@@ -1040,7 +1040,7 @@ class StudentV9:
     def step(self):
         # Adapt the effective LR to keep gradient magnitudes near a target.
         g_rms = float(np.mean(self.grad_rms()))
-        g_scale = float(np.clip(self.cfg.grad_target / max(g_rms, 1e-6), 0.2, 100.0))
+        g_scale = float(np.clip(self.cfg.grad_target / max(g_rms, 1e-6), 0.2, 10.0))
         base = self.cfg.base_lr * g_scale
         etas = self.u.eta(base)
         for l, blk in enumerate(self.blocks):
@@ -1392,6 +1392,7 @@ class SpiralV9:
                     self.student.u.rho[l] += cfg.rho_boost  # reduce LR
             # re-clamp after hazard nudging to prevent runaway shrinkage of learning rate
             self.student.u.rho = np.clip(self.student.u.rho, -2.0, 2.0)
+            self.student.u.rho *= 0.999
             self.student.set_keepk_layerwise(keepk_new)
 
             # logging
