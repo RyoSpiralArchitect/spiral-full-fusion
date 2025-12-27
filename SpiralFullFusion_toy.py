@@ -312,6 +312,18 @@ def make_bigram(V: int, seed: int = 0, latent: int = 8) -> np.ndarray:
     P = P / np.maximum(P.sum(axis=1, keepdims=True), EPS)
     return P.astype(np.float32)
 
+def bigram_from_tokens(tokens: np.ndarray, V: int, bos_id: int = 2, eos_id: int = 3,
+                       smoothing: float = 0.5) -> np.ndarray:
+    # Estimate transition probabilities directly from dataset tokens.
+    counts = np.full((V, V), float(smoothing), dtype=np.float32)
+    clipped = np.clip(tokens.astype(np.int64), 0, V - 1)
+    for a, b in zip(clipped[:-1], clipped[1:]):
+        if a == eos_id or b == bos_id:
+            continue
+        counts[a, b] += 1.0
+    P = counts / np.maximum(counts.sum(axis=1, keepdims=True), EPS)
+    return P.astype(np.float32)
+
 def sample_batch_bigram(P: np.ndarray, ctx_len: int, B: int, rng: np.random.Generator):
     V = P.shape[0]
     tokens = np.zeros((B, ctx_len + 1), dtype=np.int64)
@@ -365,6 +377,23 @@ def sample_batch_from_array(data: np.ndarray, ctx_len: int, B: int, rng: np.rand
     ctx = np.clip(ctx, 0, V - 1)
     y = np.clip(y, 0, V - 1)
     return ctx, y
+
+def build_ctx_target_pairs(tokens: np.ndarray, ctx_len: int, V: int, bos_id: int = 2, eos_id: int = 3) -> Tuple[np.ndarray, np.ndarray]:
+    spans = _line_spans_from_bos_eos(tokens, ctx_len, bos_id=bos_id, eos_id=eos_id)
+    ctxs: List[np.ndarray] = []; ys: List[int] = []
+    clipped = np.clip(tokens.astype(np.int64), 0, V - 1)
+    if spans:
+        for smin, smax in spans:
+            for start in range(smin, smax - ctx_len):
+                window = clipped[start:start+ctx_len+1]
+                ctxs.append(window[:-1]); ys.append(int(window[-1]))
+    else:
+        for start in range(0, clipped.shape[0] - ctx_len):
+            window = clipped[start:start+ctx_len+1]
+            ctxs.append(window[:-1]); ys.append(int(window[-1]))
+    if not ctxs:
+        return np.zeros((0, ctx_len), dtype=np.int64), np.zeros((0,), dtype=np.int64)
+    return np.stack(ctxs, axis=0), np.array(ys, dtype=np.int64)
 
 def rag_bcsr_bigram(tokens_batch: np.ndarray, vocab_size: int, P: np.ndarray, m: int = 8, w: float = 1.5):
     B = tokens_batch.shape[0]
@@ -968,6 +997,8 @@ def dTdSigma(B: np.ndarray, logits: np.ndarray, Sigma: np.ndarray,
 class TrainCfg:
     steps: int = 30; batch: int = 16; ctx_len: int = 8
     data_path: Optional[str] = None  # optional npy file of token ids for local data
+    valid_frac: float = 0.1
+    eval_every: int = 10
     # student T hyper
     T0: float = 1.0; lam: float = 1.0; gamma: float = 1.0; Tmin: float = 0.7; Tmax: float = 1.8; topk: int = 40
     # distillation weight (single membrane for compactness)
@@ -984,6 +1015,8 @@ class SpiralV9:
                  seed: int = 0, student_cfg: Optional[StudentCfg] = None):
         self.V, self.d, self.H, self.L, self.r = V, d, H, L, r
         self.seed = seed
+        if student_cfg is not None and student_cfg.V != V:
+            raise ValueError("StudentCfg.V must match SpiralV9 V to keep vocabulary consistent")
         self.P = make_bigram(V, seed=7 + seed)
         self.teacher = SpiralTeacher(V, d, H, L, r, self.P, TeacherCfg(), seed=42 + seed)
         cfg = student_cfg or StudentCfg(L=max(4, L), d=d, k=max(16, d // 4), V=V, r=r, seed=123 + seed)
@@ -997,7 +1030,7 @@ class SpiralV9:
     def save_weights(self, path: str):
         state = dict(
             student_state=self.student.state_dict(),
-            teacher_meta=dict(V=self.V, d=self.d, H=self.H, L=self.L, r=self.r, seed=self.seed),
+            teacher_meta=dict(V=self.V, vocab_size=self.V, d=self.d, H=self.H, L=self.L, r=self.r, seed=self.seed),
             teacher_state=self.teacher.state_dict(),
         )
         if self.tokenizer is not None:
@@ -1022,12 +1055,15 @@ class SpiralV9:
             if hasattr(teacher_state, "item") and not isinstance(teacher_state, dict):
                 teacher_state = teacher_state.item()
         cfg = StudentCfg(**student_state["cfg"])
-        V = meta.get("V", cfg.V); d = meta.get("d", cfg.d); H = meta.get("H", 4); L = meta.get("L", cfg.L); r = meta.get("r", cfg.r)
+        V_meta = meta.get("vocab_size", meta.get("V", cfg.V))
+        V = V_meta; d = meta.get("d", cfg.d); H = meta.get("H", 4); L = meta.get("L", cfg.L); r = meta.get("r", cfg.r)
         base_seed = meta.get("seed", 0)
         eng = cls(V=V, d=d, H=H, L=L, r=r, seed=base_seed, student_cfg=cfg)
         eng.student.load_state(student_state)
         if teacher_state is not None:
             eng.teacher.load_state(teacher_state)
+        if eng.student.cfg.V != eng.V:
+            raise ValueError(f"Loaded student vocab ({eng.student.cfg.V}) does not match engine V ({eng.V})")
         # assert shapes before sharing projection
         assert eng.student.B.shape == eng.teacher.fusers[0].B.shape, "B shape mismatch"
         assert eng.student.cfg.r == eng.student.B.shape[0], "student r mismatch"
@@ -1042,6 +1078,8 @@ class SpiralV9:
             if hasattr(tok_state, "item") and not isinstance(tok_state, dict):
                 tok_state = tok_state.item()
             eng.tokenizer = SpiralTokenizer.from_state(tok_state)
+            if eng.tokenizer.vocab_size != eng.V:
+                raise ValueError(f"Tokenizer vocab ({eng.tokenizer.vocab_size}) does not match model V ({eng.V}); ensure saved vocab is reused.")
         return eng
 
     def generate(self, prompt_ids: np.ndarray, max_new_tokens: int = 32,
@@ -1083,9 +1121,61 @@ class SpiralV9:
                             temperature=temperature, top_p=top_p, top_k=top_k, rng_seed=rng_seed)
         return tokenizer.decode(gen)
 
+    def _train_valid_split(self, tokens: np.ndarray, ctx_len: int, valid_frac: float,
+                           bos_id: int, eos_id: int) -> Tuple[np.ndarray, Optional[np.ndarray]]:
+        if tokens is None or tokens.shape[0] < ctx_len + 2:
+            return tokens, None
+        N = tokens.shape[0]
+        vf = float(np.clip(valid_frac, 0.0, 0.9))
+        split = int(max(ctx_len + 1, min(N - (ctx_len + 1), round(N * (1.0 - vf)))))
+        train_tokens = tokens[:split].copy()
+        valid_tokens = tokens[split:].copy()
+        # ensure BOS/EOS boundaries are respected by keeping the boundary token at the start of valid split
+        if valid_tokens.size > 0 and train_tokens.size > 0 and train_tokens[-1] == bos_id:
+            train_tokens = train_tokens[:-1]
+        if valid_tokens.size > 0 and valid_tokens[0] == eos_id:
+            valid_tokens = valid_tokens[1:]
+        return train_tokens, valid_tokens if valid_tokens.size > 0 else None
+
+    def _eval_split(self, ctxs: np.ndarray, ys: np.ndarray, batch: int) -> Optional[Tuple[float, float]]:
+        if ctxs.shape[0] == 0:
+            return None
+        total_loss = 0.0; total = 0; correct = 0
+        for start in range(0, ctxs.shape[0], batch):
+            ctx_b = ctxs[start:start+batch]; y_b = ys[start:start+batch]
+            logits, _ = self.student.forward(ctx_b)
+            p = softmax_rows(logits)
+            nll = -np.log(np.maximum(p[np.arange(y_b.shape[0]), y_b], 1e-12))
+            total_loss += float(nll.sum())
+            total += y_b.shape[0]
+            correct += int((np.argmax(p, axis=1) == y_b).sum())
+        if total == 0:
+            return None
+        ppl = float(np.exp(total_loss / max(1, total)))
+        acc = float(correct) / max(1, total)
+        return ppl, acc
+
     def train(self, cfg: TrainCfg, data_tokens: Optional[np.ndarray] = None) -> List[Dict[str, float]]:
         rng = np.random.default_rng(0)
         logs = []
+        bos_id = getattr(self.tokenizer, "bos_id", 2)
+        eos_id = getattr(self.tokenizer, "eos_id", 3)
+        train_tokens = None; valid_tokens = None
+        eval_train_ctx = eval_train_y = eval_valid_ctx = eval_valid_y = None
+        if data_tokens is not None:
+            flat = data_tokens.astype(np.int64).reshape(-1)
+            train_tokens, valid_tokens = self._train_valid_split(flat, ctx_len=cfg.ctx_len,
+                                                                 valid_frac=cfg.valid_frac,
+                                                                 bos_id=bos_id, eos_id=eos_id)
+            if train_tokens is None or train_tokens.shape[0] < cfg.ctx_len + 1:
+                raise ValueError("Provided data_tokens are too short for the requested ctx_len")
+            self.P = bigram_from_tokens(train_tokens, self.V, bos_id=bos_id, eos_id=eos_id)
+            self.teacher.P = self.P
+            eval_train_ctx, eval_train_y = build_ctx_target_pairs(train_tokens, ctx_len=cfg.ctx_len, V=self.V,
+                                                                  bos_id=bos_id, eos_id=eos_id)
+            if valid_tokens is not None and valid_tokens.shape[0] >= cfg.ctx_len + 1:
+                eval_valid_ctx, eval_valid_y = build_ctx_target_pairs(valid_tokens, ctx_len=cfg.ctx_len, V=self.V,
+                                                                      bos_id=bos_id, eos_id=eos_id)
         # initial keepk from teacher suggestion
         logits_dummy, Ts_dummy, mv_dummy, meta = self.teacher.forward_batch(np.zeros((1, cfg.ctx_len), dtype=np.int64))
         keepk = np.clip(meta["keepk_suggest"], 2, self.student.cfg.k).astype(np.int32)
@@ -1094,10 +1184,11 @@ class SpiralV9:
 
         for step in range(cfg.steps):
             Bn = cfg.batch
-            if data_tokens is None:
+            if train_tokens is None:
                 ctx, y = sample_batch_bigram(self.P, ctx_len=cfg.ctx_len, B=Bn, rng=rng)
             else:
-                ctx, y = sample_batch_from_array(data_tokens, ctx_len=cfg.ctx_len, B=Bn, rng=rng, V=self.V)
+                ctx, y = sample_batch_from_array(train_tokens, ctx_len=cfg.ctx_len, B=Bn, rng=rng, V=self.V,
+                                                 bos_id=bos_id, eos_id=eos_id)
             embed_prev = self.student.embed.W.copy()
 
             # teacher
@@ -1160,7 +1251,7 @@ class SpiralV9:
             # logging
             rag_w = self.teacher.rag_src_weight
             rag_stats = dict(rag_min=float(rag_w.min()), rag_max=float(rag_w.max()), rag_mean=float(rag_w.mean()))
-            logs.append(dict(step=step+1, CE=float(ce), KL=float(kl),
+            log_entry = dict(step=step+1, CE=float(ce), KL=float(kl),
                              ECE=float(np.mean(np.max(p_s, axis=-1) - (np.argmax(p_s, axis=-1) == y).astype(np.float32))),
                              T=float(T_S.mean()), var=float(meanVars.mean()),
                              eta0=float(etas[0]), rho0=float(self.student.u.rho[0]), keepk0=int(self.student._keepk[0]),
@@ -1170,7 +1261,23 @@ class SpiralV9:
                              hazard_teach=float(hazard_teach.mean()), hazard_teach_all=hazard_teach.tolist(),
                              hazard_grad=float(hazard_grad.mean()), hazard_grad_all=hazard_grad.tolist(),
                              embed_dnorm=embed_delta, embed_gnorm=embed_gnorm,
-                             **rag_stats))
+                             **rag_stats)
+            if train_tokens is not None and ((step + 1) % cfg.eval_every == 0 or (step + 1) == cfg.steps):
+                eval_train = self._eval_split(eval_train_ctx, eval_train_y, cfg.batch) if eval_train_ctx is not None else None
+                if eval_train is not None:
+                    log_entry["ppl_train"], log_entry["acc_train"] = eval_train
+                if eval_valid_ctx is not None and eval_valid_y is not None:
+                    eval_valid = self._eval_split(eval_valid_ctx, eval_valid_y, cfg.batch)
+                    if eval_valid is not None:
+                        log_entry["ppl_valid"], log_entry["acc_valid"] = eval_valid
+                if eval_train is not None or eval_valid_ctx is not None:
+                    msg = [f"[eval step {step+1}]"]
+                    if eval_train is not None:
+                        msg.append(f"train ppl={log_entry.get('ppl_train', float('nan')):.3f} acc={log_entry.get('acc_train', float('nan')):.3f}")
+                    if eval_valid is not None:
+                        msg.append(f"valid ppl={log_entry.get('ppl_valid', float('nan')):.3f} acc={log_entry.get('acc_valid', float('nan')):.3f}")
+                    print(" | ".join(msg))
+            logs.append(log_entry)
             if (step+1) % 5 == 0:
                 print(f"[{step+1:03d}] CE={ce:.4f} KL={kl:.4f} ECE={logs[-1]['ECE']:.4f} | "
                       f"T={T_S.mean():.3f} var~={meanVars.mean():.4f} | η0={etas[0]:.4e} ρ0={self.student.u.rho[0]:+.3f} keepk0={self.student._keepk[0]} | "
@@ -1185,6 +1292,7 @@ class SpiralV9:
 # ------------------------------
 def demo(args=None):
     import argparse
+    import json
     def _looks_like_id_list(s: str) -> bool:
         parts = [p.strip() for p in s.split(",") if p.strip() != ""]
         if not parts:
@@ -1199,6 +1307,8 @@ def demo(args=None):
     p.add_argument("--steps", type=int, default=500)
     p.add_argument("--batch", type=int, default=16)
     p.add_argument("--ctx_len", type=int, default=8)
+    p.add_argument("--valid_frac", type=float, default=0.1, help="fraction of tokens reserved for validation")
+    p.add_argument("--eval_every", type=int, default=10, help="evaluation interval (steps)")
     p.add_argument("--V", type=int, default=128)
     p.add_argument("--d", type=int, default=96)
     p.add_argument("--H", type=int, default=4)
@@ -1220,6 +1330,7 @@ def demo(args=None):
     p.add_argument("--top_p", type=float, default=0.9, help="top-p nucleus threshold for sampling")
     p.add_argument("--rng_seed", type=int, default=0, help="seed for sampler reproducibility")
     p.add_argument("--top_k", type=int, default=None, help="optional top-k cutoff before top-p (nucleus) sampling")
+    p.add_argument("--log_path", type=str, default=None, help="optional JSON path to save training logs")
     parsed = p.parse_args(args=args)
 
     data_tokens = None
@@ -1228,7 +1339,10 @@ def demo(args=None):
 
     if parsed.data_path:
         data_tokens = np.load(parsed.data_path).astype(np.int64).reshape(-1)
-        data_tokens = np.clip(data_tokens, 0, parsed.V - 1)
+        data_vmax = int(data_tokens.max()) + 1 if data_tokens.size > 0 else 0
+        vocab_override = max(vocab_override, data_vmax)
+        data_tokens = np.clip(data_tokens, 0, vocab_override - 1)
+        print(f"[data] Loaded tokens from {parsed.data_path} (N={data_tokens.size}, vmax={data_vmax})")
     if parsed.text_path and data_tokens is None:
         with open(parsed.text_path, "r", encoding="utf-8") as f:
             text = f.read()
@@ -1238,8 +1352,11 @@ def demo(args=None):
         tokenizer = SpiralTokenizer(tok_cfg)
         tokenizer.train_from_text(text)
         data_tokens = tokenizer.encode_corpus(text)
-        vocab_override = max(vocab_override, tokenizer.vocab_size)
+        vocab_override = tokenizer.vocab_size
         data_tokens = np.clip(data_tokens, 0, vocab_override - 1)
+        print(f"[tokenizer] Trained tokenizer (vocab={tokenizer.vocab_size}) from {parsed.text_path}; corpus tokens={data_tokens.size}")
+    if tokenizer is not None:
+        vocab_override = max(vocab_override, tokenizer.vocab_size)
 
     if parsed.load_path:
         eng = SpiralV9.load(parsed.load_path)
@@ -1247,17 +1364,30 @@ def demo(args=None):
     else:
         eng = SpiralV9(V=vocab_override, d=parsed.d, H=parsed.H, L=parsed.L, r=parsed.r, seed=parsed.seed)
 
-    if tokenizer is not None:
+    if tokenizer is not None and eng.tokenizer is None:
         eng.set_tokenizer(tokenizer)
+    elif eng.tokenizer is not None and tokenizer is not None and eng.tokenizer.vocab_size != tokenizer.vocab_size:
+        raise ValueError("Tokenizer vocab must match the loaded model vocabulary")
+    # ensure data tokens fit the engine vocab (no silent truncation)
+    if data_tokens is not None:
+        vocab_cap = eng.V
+        if data_tokens.size > 0 and int(data_tokens.max()) >= vocab_cap:
+            raise ValueError(f"data tokens contain ids >= model vocab ({vocab_cap}); regenerate with the saved tokenizer")
+        data_tokens = np.clip(data_tokens, 0, vocab_cap - 1)
 
     logs: List[Dict[str, float]] = []
     if parsed.steps > 0:
         cfg = TrainCfg(steps=parsed.steps, batch=parsed.batch, ctx_len=parsed.ctx_len,
+                       valid_frac=parsed.valid_frac, eval_every=parsed.eval_every,
                        T0=1.0, lam=1.0, gamma=1.0, Tmin=0.7, Tmax=1.8, topk=48,
                        lam_distil=0.1, lr_k_stab=0.02, lr_k_expl=0.01,
                        keepk_boost=2, rho_boost=0.0, backprop_T=True, T_grad_scale=0.1,
                        data_path=parsed.data_path)
         logs = eng.train(cfg, data_tokens=data_tokens)
+        if logs and parsed.log_path:
+            with open(parsed.log_path, "w", encoding="utf-8") as f:
+                json.dump(logs, f, ensure_ascii=False, indent=2)
+            print(f"[logs] Saved training logs to {parsed.log_path}")
         if parsed.save_path:
             eng.save_weights(parsed.save_path)
             print(f"Saved weights to {parsed.save_path}")
@@ -1267,24 +1397,24 @@ def demo(args=None):
         print(f"Re-saved weights to {parsed.save_path}")
 
     # Inference / decoder
-        if parsed.prompt is not None:
-            rng_seed = parsed.rng_seed
-            prompt_is_ids = _looks_like_id_list(parsed.prompt)
-            if eng.tokenizer is not None and not prompt_is_ids:
-                text = eng.generate_text(parsed.prompt, eng.tokenizer,
-                                         max_new_tokens=parsed.max_new_tokens,
-                                         temperature=parsed.temperature, top_p=parsed.top_p, top_k=parsed.top_k,
-                                         rng_seed=rng_seed)
-                print(">> generated text:", text)
-            else:
-                try:
-                    ids = np.array([int(x) for x in parsed.prompt.split(",") if x.strip() != ""], dtype=np.int64) if prompt_is_ids else \
-                      np.array([min(b, eng.V - 1) for b in parsed.prompt.encode("utf-8")], dtype=np.int64)
-                except ValueError:
-                    raise ValueError("Provide a tokenizer or pass comma-separated token ids for prompt")
-                gen = eng.generate(ids, max_new_tokens=parsed.max_new_tokens,
-                                   temperature=parsed.temperature, top_p=parsed.top_p, top_k=parsed.top_k, rng_seed=rng_seed)
-                print(">> generated token ids:", gen.tolist())
+    if parsed.prompt is not None:
+        rng_seed = parsed.rng_seed
+        prompt_is_ids = _looks_like_id_list(parsed.prompt)
+        if eng.tokenizer is not None and not prompt_is_ids:
+            text = eng.generate_text(parsed.prompt, eng.tokenizer,
+                                     max_new_tokens=parsed.max_new_tokens,
+                                     temperature=parsed.temperature, top_p=parsed.top_p, top_k=parsed.top_k,
+                                     rng_seed=rng_seed)
+            print(">> generated text:", text)
+        else:
+            try:
+                ids = np.array([int(x) for x in parsed.prompt.split(",") if x.strip() != ""], dtype=np.int64) if prompt_is_ids else \
+                  np.array([min(b, eng.V - 1) for b in parsed.prompt.encode("utf-8")], dtype=np.int64)
+            except ValueError:
+                raise ValueError("Provide a tokenizer or pass comma-separated token ids for prompt")
+            gen = eng.generate(ids, max_new_tokens=parsed.max_new_tokens,
+                               temperature=parsed.temperature, top_p=parsed.top_p, top_k=parsed.top_k, rng_seed=rng_seed)
+            print(">> generated token ids:", gen.tolist())
 
     print("== SpiralFullFusion V9 (compact) Demo — DONE ==")
     return logs
