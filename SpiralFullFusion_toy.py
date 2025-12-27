@@ -35,7 +35,7 @@ def safe_matmul(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     return y
 
 
-def apply_logit_gain(logits: np.ndarray, gain: float, target_std: float = 1.5, max_scale: float = 500.0) -> Tuple[np.ndarray, float]:
+def apply_logit_gain(logits: np.ndarray, gain: float, target_std: float = 1.5, max_scale: float = 20000.0) -> Tuple[np.ndarray, float]:
     """
     Rescale logits to avoid near-uniform outputs.
       - gain > 0: use directly (clamped to max_scale)
@@ -1134,7 +1134,7 @@ class SpiralTeacher:
         mem_punish_frac = float(mem_punished) / max(1, mem_used)
 
         gain = float(self.cfg.logit_gain if logit_gain is None else logit_gain)
-        logits, gain_used = apply_logit_gain(logits, gain, target_std=1.5, max_scale=250.0)
+        logits, gain_used = apply_logit_gain(logits, gain, target_std=1.5, max_scale=20000.0)
 
         meta = dict(
             meanVar=float(meanVars.mean()),
@@ -1407,10 +1407,13 @@ class StudentV9:
         mu, tau = self.rank_head.forward(h)  # [B,r], [B,r]
         logits = safe_matmul(mu, self.B)     # [B,V]
         Sigma = 1.0 / np.maximum(tau, 1e-6)  # [B,r]
-        logits, gain_used = apply_logit_gain(logits, logit_gain, target_std=1.5, max_scale=250.0)
+        logits, gain_used = apply_logit_gain(logits, logit_gain, target_std=1.5, max_scale=20000.0)
         return logits, dict(h=h, mu=mu, tau=tau, Sigma=Sigma, attn=attn_maps, logit_gain_used=float(gain_used))
 
     def backward(self, dlogits: np.ndarray, aux: Dict[str, Any], dSigma_from_T: Optional[np.ndarray] = None):
+        # undo logit gain scaling for proper gradients
+        gain_used = float(aux.get("logit_gain_used", 1.0))
+        dlogits = (dlogits * gain_used).astype(np.float32)
         # dmu from logits
         dmu = safe_matmul(dlogits, self.B.T)    # [B,r]
         dtau = np.zeros_like(aux["tau"])        # [B,r]
@@ -1532,7 +1535,7 @@ def brier_score(probs: np.ndarray, y: np.ndarray) -> float:
     B = y.shape[0]
     oh = np.zeros_like(probs, dtype=np.float32)
     oh[np.arange(B), y] = 1.0
-    return float(np.mean((probs - oh) ** 2))
+    return float(np.mean(np.sum((probs - oh) ** 2, axis=1)))
 
 def ce_with_temp(logits: np.ndarray, y: np.ndarray, T: np.ndarray) -> Tuple[float, np.ndarray, np.ndarray]:
     z = logits / np.maximum(T, 1e-6); p = softmax_rows(z)
@@ -1583,18 +1586,18 @@ def T_from_Sigma(B: np.ndarray, Sigma: np.ndarray, logits: np.ndarray,
     return T, meanVar.squeeze(-1), var_top
 
 def dCEdT(logits: np.ndarray, y: np.ndarray, T: np.ndarray) -> np.ndarray:
-    # ∂CE/∂T ≈ (1/T^2) * (E_p[z] - z_y)
+    # ∂CE/∂T ≈ (1/T^2) * (z_y - E_p[z])
     z = logits / np.maximum(T, 1e-6); p = softmax_rows(z)
     Ez = (p * logits).sum(axis=1, keepdims=True)  # [B,1]
     zy = logits[np.arange(logits.shape[0]), y][:, None]
-    d = (Ez - zy) / (np.maximum(T, 1e-6)**2)
+    d = (zy - Ez) / (np.maximum(T, 1e-6)**2)
     return d.astype(np.float32)  # [B,1]
 
 def dTdSigma(B: np.ndarray, logits: np.ndarray, Sigma: np.ndarray,
              T: np.ndarray, meanVar: np.ndarray, var_top: np.ndarray,
              T0: float = 1.0, lam: float = 1.0, gamma: float = 1.0, k: int = 40,
              Tmin: float = 0.7, Tmax: float = 1.8) -> np.ndarray:
-    # ∂T/∂Σ_r = T0 * γ * λ * (1+λ m)^{γ-1} * (1/k) * sum_{j∈topk} B_{rj}^2
+    # ∂T/∂Σ_r = T0 * γ * λ * (1+λ m)^{γ-1} * mean_{j∈topk} B_{rj}^2
     B2 = (B * B)  # [r,V]
     k_eff = var_top.shape[1]
     # pick same topk as in T_from_Sigma
@@ -1605,7 +1608,7 @@ def dTdSigma(B: np.ndarray, logits: np.ndarray, Sigma: np.ndarray,
         avg_B2[b] = B2[:, idx[b]].mean(axis=1)  # [r]
     rawT = (T0 * np.power(1.0 + lam * meanVar[:, None], gamma)).astype(np.float32)
     factor = (T0 * gamma * lam * np.power(1.0 + lam * meanVar[:, None], max(0.0, gamma - 1.0))).astype(np.float32)
-    dT_dSigma = (factor / max(1, k_eff)) * avg_B2  # [B,r]
+    dT_dSigma = factor * avg_B2  # [B,r]
     clamped = (rawT <= (Tmin + 1e-6)) | (rawT >= (Tmax - 1e-6))
     if clamped.any():
         dT_dSigma[clamped[:, 0]] = 0.0
