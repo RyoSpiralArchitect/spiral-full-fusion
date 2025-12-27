@@ -21,3 +21,27 @@ python SpiralFullFusion_toy.py
 ```
 
 You’ll get a brisk training run that paints the loop: generate → reliability + RAG audit → distill → temperature feedback → repeat. It’s a pocket-sized, proudly experimental demo of reliability-aware distillation with retrieval twists.
+
+## New tricks: save/load + decoder
+- **Checkpoint everything**: tokenizer, teacher (including reliability trackers and RAG weights), student, and shared projection are all packed into a single `.npz` via `save_weights`.
+- **Resume or just decode**: `--load_path` restores a checkpoint; set `--steps 0` to skip training and jump straight to inference.
+- **Seeded nucleus sampling**: control stochastic decoding with `--rng_seed`, `--temperature`, and `--top_p`, generating text (if tokenizer present) or raw token IDs.
+- **Custom data or text**: point `--data_path` at a NumPy token array, or `--text_path` at UTF-8 text to train the built-in byte-level tokenizer (configurable with `--tok_*` flags).
+- **Reproducible spins**: use `--seed` to set the base seed for synthetic bigram data and initial weights when starting fresh.
+
+## Usage samples
+Train from scratch and save:
+```bash
+python SpiralFullFusion_toy.py --steps 200 --batch 16 --ctx_len 8 --save_path /tmp/spiral_demo.npz --seed 7
+```
+
+Train on your text (tokenizer auto-trained), then decode:
+```bash
+python SpiralFullFusion_toy.py --text_path my_corpus.txt --tok_vocab 512 --steps 300 --save_path /tmp/spiral_text.npz
+python SpiralFullFusion_toy.py --steps 0 --load_path /tmp/spiral_text.npz --prompt "hello spiral" --max_new_tokens 32 --rng_seed 123
+```
+
+Decode from a saved checkpoint using token IDs:
+```bash
+python SpiralFullFusion_toy.py --steps 0 --load_path /tmp/spiral_demo.npz --prompt "1,2,3" --max_new_tokens 24 --temperature 1.1 --top_p 0.9
+```

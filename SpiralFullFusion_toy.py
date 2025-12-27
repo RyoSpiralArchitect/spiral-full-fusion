@@ -394,6 +394,17 @@ class ToyDeepLM:
         self.W_heads = rng.normal(0, 0.05, size=(L, H, d, d)).astype(np.float32) / np.sqrt(max(1, d))
         self.b_heads = np.zeros((L, H, d), dtype=np.float32)
 
+    def state_dict(self) -> Dict[str, np.ndarray]:
+        return dict(E=self.E.copy(), W_layers=self.W_layers.copy(), b_layers=self.b_layers.copy(),
+                    W_heads=self.W_heads.copy(), b_heads=self.b_heads.copy())
+
+    def load_state(self, state: Dict[str, np.ndarray]):
+        self.E = state["E"].astype(np.float32)
+        self.W_layers = state["W_layers"].astype(np.float32)
+        self.b_layers = state["b_layers"].astype(np.float32)
+        self.W_heads = state["W_heads"].astype(np.float32)
+        self.b_heads = state["b_heads"].astype(np.float32)
+
     def encode_heads_per_layer(self, tokens: np.ndarray) -> List[List[np.ndarray]]:
         if tokens.ndim == 2: tokens = tokens[0]
         embs = self.E[tokens]    # [T,d]
@@ -441,6 +452,18 @@ class BayesHeadFuseLR:
         B2 = (self.B * self.B)                  # [r,V]
         return safe_matmul(var_r[None, :], B2)[0]  # [V]
 
+    def state_dict(self) -> Dict[str, np.ndarray]:
+        return dict(A=self.A.copy(), B=self.B.copy(), W1=self.W1.copy(), b1=self.b1.copy(),
+                    W2=self.W2.copy(), b2=self.b2.copy(), rho=np.array(self.rho, dtype=np.float32),
+                    tau0=np.array(self.tau0, dtype=np.float32))
+
+    def load_state(self, state: Dict[str, np.ndarray]):
+        self.A = state["A"].astype(np.float32)
+        self.B = state["B"].astype(np.float32)
+        self.W1 = state["W1"].astype(np.float32); self.b1 = state["b1"].astype(np.float32)
+        self.W2 = state["W2"].astype(np.float32); self.b2 = state["b2"].astype(np.float32)
+        self.rho = float(np.array(state["rho"]).item()); self.tau0 = float(np.array(state["tau0"]).item())
+
 class ReliabilityTracker:
     def __init__(self, L: int, H: int, ema: float = 0.7):
         self.L, self.H = L, H; self.ema = float(ema)
@@ -463,6 +486,14 @@ class ReliabilityTracker:
         stab = (self.y > stab_thr).astype(np.float32)
         expl = (self.y <= stab_thr).astype(np.float32)
         return xz, stab, expl
+
+    def state_dict(self) -> Dict[str, np.ndarray]:
+        return dict(x=self.x.copy(), y=self.y.copy(), n=self.n.copy())
+
+    def load_state(self, state: Dict[str, np.ndarray]):
+        self.x = state["x"].astype(np.float32)
+        self.y = state["y"].astype(np.float32)
+        self.n = state["n"].astype(np.int32)
 
 @dataclass
 class TeacherCfg:
@@ -589,6 +620,30 @@ class SpiralTeacher:
 
         meta = dict(meanVar=float(meanVars.mean()), layer_hazard=layer_hazard, keepk_suggest=keepk_suggest)
         return logits, Ts, meanVars, meta
+
+    def state_dict(self) -> Dict[str, Any]:
+        return dict(
+            P=self.P.copy(),
+            lm=self.lm.state_dict(),
+            fusers=[f.state_dict() for f in self.fusers],
+            rel=self.rel.state_dict(),
+            rag_src_weight=self.rag_src_weight.copy(),
+            cfg=asdict(self.cfg),
+        )
+
+    def load_state(self, state: Dict[str, Any]):
+        self.P = state["P"].astype(np.float32)
+        self.cfg = TeacherCfg(**state.get("cfg", asdict(self.cfg)))
+        self.lm.load_state(state["lm"])
+        for f, saved in zip(self.fusers, state["fusers"]):
+            f.load_state(saved)
+        # ensure B is shared after load
+        B0 = self.fusers[0].B
+        for f in self.fusers[1:]:
+            f.B = B0
+        self.B = B0
+        self.rel.load_state(state["rel"])
+        self.rag_src_weight = state.get("rag_src_weight", np.ones((self.V,), dtype=np.float32)).astype(np.float32)
 
 # ------------------------------
 # Student: Rank-K blocks + RankParamHead + UncertaintyLR + T_S(Σ) backprop (approx)
@@ -778,6 +833,8 @@ class StudentV9:
         self.rank_head.mean.b = state["rank_head"]["mean"]["b"].astype(np.float32)
         self.rank_head.logtau.W = state["rank_head"]["logtau"]["W"].astype(np.float32)
         self.rank_head.logtau.b = state["rank_head"]["logtau"]["b"].astype(np.float32)
+        # keepk size might mismatch if cfg changed; clamp safely
+        self._keepk = np.clip(self._keepk, 2, self.cfg.k)
 
     def set_keepk_layerwise(self, keepk: np.ndarray):
         # Accept keepk arrays shorter/longer than student depth and broadcast safely.
@@ -926,9 +983,10 @@ class SpiralV9:
     def __init__(self, V: int = 128, d: int = 96, H: int = 4, L: int = 4, r: int = 64,
                  seed: int = 0, student_cfg: Optional[StudentCfg] = None):
         self.V, self.d, self.H, self.L, self.r = V, d, H, L, r
-        self.P = make_bigram(V, seed=7)
-        self.teacher = SpiralTeacher(V, d, H, L, r, self.P, TeacherCfg(), seed=42)
-        cfg = student_cfg or StudentCfg(L=max(4, L), d=d, k=max(16, d // 4), V=V, r=r, seed=123)
+        self.seed = seed
+        self.P = make_bigram(V, seed=7 + seed)
+        self.teacher = SpiralTeacher(V, d, H, L, r, self.P, TeacherCfg(), seed=42 + seed)
+        cfg = student_cfg or StudentCfg(L=max(4, L), d=d, k=max(16, d // 4), V=V, r=r, seed=123 + seed)
         self.student = StudentV9(cfg, self.teacher.B)
         self.tokenizer: Optional[SpiralTokenizer] = None
 
@@ -939,7 +997,8 @@ class SpiralV9:
     def save_weights(self, path: str):
         state = dict(
             student_state=self.student.state_dict(),
-            teacher_meta=dict(V=self.V, d=self.d, H=self.H, L=self.L, r=self.r),
+            teacher_meta=dict(V=self.V, d=self.d, H=self.H, L=self.L, r=self.r, seed=self.seed),
+            teacher_state=self.teacher.state_dict(),
         )
         if self.tokenizer is not None:
             state["tokenizer_state"] = self.tokenizer.state_dict()
@@ -956,11 +1015,23 @@ class SpiralV9:
         meta = meta_raw[0] if isinstance(meta_raw, np.ndarray) else meta_raw
         if hasattr(meta, "item") and not isinstance(meta, dict):
             meta = meta.item()
+        teacher_raw = data["teacher_state"] if "teacher_state" in data else None
+        teacher_state = None
+        if teacher_raw is not None:
+            teacher_state = teacher_raw[0] if isinstance(teacher_raw, np.ndarray) else teacher_raw
+            if hasattr(teacher_state, "item") and not isinstance(teacher_state, dict):
+                teacher_state = teacher_state.item()
         cfg = StudentCfg(**student_state["cfg"])
         V = meta.get("V", cfg.V); d = meta.get("d", cfg.d); H = meta.get("H", 4); L = meta.get("L", cfg.L); r = meta.get("r", cfg.r)
-        eng = cls(V=V, d=d, H=H, L=L, r=r, seed=0, student_cfg=cfg)
+        base_seed = meta.get("seed", 0)
+        eng = cls(V=V, d=d, H=H, L=L, r=r, seed=base_seed, student_cfg=cfg)
         eng.student.load_state(student_state)
-        eng.teacher.B = eng.student.B  # align teacher logits with loaded student projection
+        if teacher_state is not None:
+            eng.teacher.load_state(teacher_state)
+        # align teacher logits with loaded student projection (B is shared)
+        eng.teacher.B = eng.student.B
+        for f in eng.teacher.fusers:
+            f.B = eng.student.B
         if "tokenizer_state" in data:
             tok_raw = data["tokenizer_state"]
             tok_state = tok_raw[0] if isinstance(tok_raw, np.ndarray) else tok_raw
@@ -1109,6 +1180,7 @@ def demo(args=None):
     p.add_argument("--H", type=int, default=4)
     p.add_argument("--L", type=int, default=4)
     p.add_argument("--r", type=int, default=64)
+    p.add_argument("--seed", type=int, default=0, help="base seed for synthetic data/initialization")
     p.add_argument("--data_path", type=str, default=None, help="optional npy file with token ids")
     p.add_argument("--text_path", type=str, default=None, help="optional utf-8 text file to train tokenizer + dataset")
     p.add_argument("--tok_vocab", type=int, default=256, help="tokenizer vocab size target when using text_path")
@@ -1122,6 +1194,7 @@ def demo(args=None):
     p.add_argument("--max_new_tokens", type=int, default=32, help="number of new tokens to generate during inference")
     p.add_argument("--temperature", type=float, default=1.0, help="sampling temperature")
     p.add_argument("--top_p", type=float, default=0.9, help="top-p nucleus threshold for sampling")
+    p.add_argument("--rng_seed", type=int, default=0, help="seed for sampler reproducibility")
     parsed = p.parse_args(args=args)
 
     data_tokens = None
@@ -1147,7 +1220,7 @@ def demo(args=None):
         eng = SpiralV9.load(parsed.load_path)
         tokenizer = tokenizer or eng.tokenizer
     else:
-        eng = SpiralV9(V=vocab_override, d=parsed.d, H=parsed.H, L=parsed.L, r=parsed.r, seed=0)
+        eng = SpiralV9(V=vocab_override, d=parsed.d, H=parsed.H, L=parsed.L, r=parsed.r, seed=parsed.seed)
 
     if tokenizer is not None:
         eng.set_tokenizer(tokenizer)
@@ -1170,7 +1243,7 @@ def demo(args=None):
 
     # Inference / decoder
     if parsed.prompt is not None:
-        rng_seed = 0
+        rng_seed = parsed.rng_seed
         prompt_is_ids = parsed.prompt.replace(",", "").strip().isdigit()
         if eng.tokenizer is not None and not prompt_is_ids:
             text = eng.generate_text(parsed.prompt, eng.tokenizer,
