@@ -5,6 +5,7 @@
 from dataclasses import dataclass, asdict
 from typing import List, Tuple, Optional, Dict, Any
 import numpy as np
+import re
 
 EPS = 1e-8
 
@@ -46,6 +47,8 @@ class TokenizerCfg:
     motif_topk: int = 48        # register top-N recurring multi-byte motifs as atomic tokens
     motif_min_len: int = 3
     motif_max_len: int = 8
+    word_topk: int = 256        # register top-N words as atomic tokens before byte motifs
+    word_min_freq: int = 2
 
 
 class SpiralTokenizer:
@@ -67,6 +70,8 @@ class SpiralTokenizer:
         self.merge_to_id: Dict[Tuple[int, int], int] = {}  # pair -> new token id
         self.motif_to_id: Dict[bytes, int] = {}
         self.motif_lengths: List[int] = []
+        self.word_to_id: Dict[bytes, int] = {}
+        self.word_lengths: List[int] = []
         self._init_base_vocab()
 
     # ------------------ training helpers ------------------
@@ -133,6 +138,17 @@ class SpiralTokenizer:
             self.motif_to_id[mot] = self.token_to_id[name]
         self.motif_lengths = sorted({len(m) for m in self.motif_to_id.keys()}, reverse=True)
 
+    def _register_words(self, words: List[bytes]):
+        if not words:
+            return
+        for w in words:
+            name = f"<word:{self._format_piece(w)}>"
+            if name in self.token_to_id:
+                continue
+            self._register_token(name, w)
+            self.word_to_id[w] = self.token_to_id[name]
+        self.word_lengths = sorted({len(w) for w in self.word_to_id.keys()}, reverse=True)
+
     def _find_top_motifs(self, lines: List[bytes]) -> List[bytes]:
         counts: Dict[bytes, int] = {}
         min_len = max(1, self.cfg.motif_min_len)
@@ -149,11 +165,36 @@ class SpiralTokenizer:
         top = [mot for mot, _ in filtered[: self.cfg.motif_topk]]
         return top
 
+    def _find_top_words(self, text: str) -> List[bytes]:
+        pattern = re.compile(r"[\\w']+")
+        words = pattern.findall(text)
+        counts: Dict[str, int] = {}
+        for w in words:
+            key = w if not self.cfg.lowercase else w.lower()
+            counts[key] = counts.get(key, 0) + 1
+        filtered = [(w, c) for w, c in counts.items() if c >= max(1, self.cfg.word_min_freq)]
+        filtered.sort(key=lambda wc: (wc[1], len(wc[0])), reverse=True)
+        top_words = [w for w, _ in filtered[: self.cfg.word_topk]]
+        return [w.encode("utf-8") for w in top_words]
+
     def _tokenize_bytes_with_motifs(self, raw_bytes: bytes) -> List[int]:
         ids: List[int] = []
         i = 0; n = len(raw_bytes)
         while i < n:
             matched = False
+            # prefer whole-word atoms, then motifs, else fallback bytes
+            for L in self.word_lengths:
+                if i + L > n:
+                    continue
+                chunk = raw_bytes[i:i+L]
+                tid = self.word_to_id.get(chunk)
+                if tid is not None:
+                    ids.append(tid)
+                    i += L
+                    matched = True
+                    break
+            if matched:
+                continue
             for L in self.motif_lengths:
                 if i + L > n:
                     continue
@@ -173,6 +214,8 @@ class SpiralTokenizer:
     def train_from_text(self, text: str):
         if self.cfg.lowercase:
             text = text.lower()
+        top_words = self._find_top_words(text)
+        self._register_words(top_words)
         # pre-tokenize raw bytes per line
         raw_lines = [line.encode("utf-8") for line in text.splitlines()]
         motifs = self._find_top_motifs(raw_lines)
@@ -270,6 +313,8 @@ class SpiralTokenizer:
             merge_to_id=self.merge_to_id,
             motif_to_id=self.motif_to_id,
             motif_lengths=self.motif_lengths,
+            word_to_id=self.word_to_id,
+            word_lengths=self.word_lengths,
         )
 
     @classmethod
@@ -286,6 +331,8 @@ class SpiralTokenizer:
         tok.merge_to_id = state["merge_to_id"]
         tok.motif_to_id = state["motif_to_id"]
         tok.motif_lengths = state["motif_lengths"]
+        tok.word_to_id = state.get("word_to_id", {})
+        tok.word_lengths = state.get("word_lengths", [])
         return tok
 
     def save(self, path: str):
@@ -336,6 +383,23 @@ def sample_batch_bigram(P: np.ndarray, ctx_len: int, B: int, rng: np.random.Gene
     ctx = tokens[:, :ctx_len].copy()
     y = tokens[:, ctx_len].copy()
     return ctx, y
+
+def trigram_from_tokens(tokens: np.ndarray, V: int, bos_id: int = 2, eos_id: int = 3,
+                        smoothing: float = 0.25) -> Dict[Tuple[int, int], np.ndarray]:
+    # Sparse trigram with additive smoothing per (a,b) pair.
+    counts: Dict[Tuple[int, int], np.ndarray] = {}
+    clipped = np.clip(tokens.astype(np.int64), 0, V - 1)
+    for a, b, c in zip(clipped[:-2], clipped[1:-1], clipped[2:]):
+        if a == eos_id or b == eos_id or c == bos_id:
+            continue
+        key = (int(a), int(b))
+        if key not in counts:
+            counts[key] = np.full((V,), float(smoothing), dtype=np.float32)
+        counts[key][c] += 1.0
+    trigram_probs: Dict[Tuple[int, int], np.ndarray] = {}
+    for key, cnt in counts.items():
+        trigram_probs[key] = cnt / np.maximum(cnt.sum(), EPS)
+    return trigram_probs
 
 def _line_spans_from_bos_eos(data: np.ndarray, ctx_len: int, bos_id: int = 2, eos_id: int = 3) -> List[Tuple[int, int]]:
     # Extract contiguous spans [bos_idx, eos_idx] that are long enough for a ctx_len+1 window.
@@ -412,12 +476,19 @@ def build_ctx_target_pairs(tokens: np.ndarray, ctx_len: int, V: int, bos_id: int
         return np.zeros((0, ctx_len), dtype=np.int64), np.zeros((0,), dtype=np.int64)
     return np.stack(ctxs, axis=0), np.array(ys, dtype=np.int64)
 
-def rag_bcsr_bigram(tokens_batch: np.ndarray, vocab_size: int, P: np.ndarray, m: int = 8, w: float = 1.5):
+def rag_bcsr_ngram(tokens_batch: np.ndarray, vocab_size: int, bigram_P: np.ndarray,
+                   trigram_map: Optional[Dict[Tuple[int, int], np.ndarray]] = None,
+                   m: int = 8, w: float = 1.5):
     B = tokens_batch.shape[0]
     indices_list = []; data_list = []; indptr = [0]
     for b in range(B):
-        last = int(tokens_batch[b, -1])
-        probs = P[last]
+        probs = None
+        if trigram_map is not None and tokens_batch.shape[1] >= 2:
+            key = (int(tokens_batch[b, -2]), int(tokens_batch[b, -1]))
+            probs = trigram_map.get(key)
+        if probs is None:
+            last = int(tokens_batch[b, -1])
+            probs = bigram_P[last]
         idx = np.argpartition(probs, -m)[-m:]
         vals = probs[idx] * float(w)
         indices_list.append(idx.astype(np.int64))
@@ -551,6 +622,7 @@ class SpiralTeacher:
     def __init__(self, V: int, d: int, H: int, L: int, r: int, P: np.ndarray, cfg: TeacherCfg, seed: int = 0):
         self.V, self.d, self.H, self.L, self.r = V, d, H, L, r
         self.P = P; self.cfg = cfg
+        self.trigram_map: Optional[Dict[Tuple[int, int], np.ndarray]] = None
         self.lm = ToyDeepLM(V, d, H, L, seed=seed)
         self.fusers = [BayesHeadFuseLR(d, V, H, r, rho=0.7, tau0=1e-4, seed=seed + l) for l in range(L)]
         # share B across layers
@@ -614,8 +686,9 @@ class SpiralTeacher:
             # logits before RAG
             logits_b = self.fusers[-1].logits_from_mu(mu_post)
 
-            # RAG delta on logits (bCSR)
-            delta = rag_bcsr_bigram(tokens_batch[b][None, :], self.V, self.P, m=8, w=1.5)
+            # RAG delta on logits (bCSR) with trigram fallback to bigram
+            delta = rag_bcsr_ngram(tokens_batch[b][None, :], self.V, self.P,
+                                   trigram_map=self.trigram_map, m=8, w=1.5)
             tag, indptr, indices, data = delta
             s, e = int(indptr[0]), int(indptr[1])
             inds = indices[s:e]; vals = data[s:e]
@@ -670,6 +743,7 @@ class SpiralTeacher:
     def state_dict(self) -> Dict[str, Any]:
         return dict(
             P=self.P.copy(),
+            trigram_map={k: v.copy() for k, v in self.trigram_map.items()} if self.trigram_map is not None else None,
             lm=self.lm.state_dict(),
             fusers=[f.state_dict() for f in self.fusers],
             rel=self.rel.state_dict(),
@@ -679,6 +753,11 @@ class SpiralTeacher:
 
     def load_state(self, state: Dict[str, Any]):
         self.P = state["P"].astype(np.float32)
+        trig = state.get("trigram_map", None)
+        if trig is not None:
+            self.trigram_map = {tuple(k): np.array(v, dtype=np.float32) for k, v in trig.items()}
+        else:
+            self.trigram_map = None
         self.cfg = TeacherCfg(**state.get("cfg", asdict(self.cfg)))
         self.lm.load_state(state["lm"])
         for f, saved in zip(self.fusers, state["fusers"]):
@@ -1021,6 +1100,9 @@ class TrainCfg:
     T0: float = 1.0; lam: float = 1.0; gamma: float = 1.0; Tmin: float = 0.7; Tmax: float = 1.8; topk: int = 40
     # distillation weight (single membrane for compactness)
     lam_distil: float = 0.1
+    distil_warmup: int = 5     # steps before blending in KL
+    ce_weight: float = 1.0
+    kl_weight: float = 1.0
     # reliability → rho nudging
     lr_k_stab: float = 0.02; lr_k_expl: float = 0.01
     # hazard → partial optimize
@@ -1186,6 +1268,7 @@ class SpiralV9:
                 raise ValueError("Provided data_tokens are too short for the requested ctx_len")
             self.P = bigram_from_tokens(train_tokens, self.V, bos_id=bos_id, eos_id=eos_id)
             self.teacher.P = self.P
+            self.teacher.trigram_map = trigram_from_tokens(train_tokens, self.V, bos_id=bos_id, eos_id=eos_id)
             eval_train_ctx, eval_train_y = build_ctx_target_pairs(train_tokens, ctx_len=cfg.ctx_len, V=self.V,
                                                                   bos_id=bos_id, eos_id=eos_id,
                                                                   max_windows=cfg.max_eval_windows, rng=eval_rng)
@@ -1222,7 +1305,11 @@ class SpiralV9:
             # losses
             ce, dlogits_ce, p_s = ce_with_temp(s_logits, y, T_S)
             kl, dlogits_kl = kl_teacher_student(t_logits, s_logits, T_S)
-            dlogits = dlogits_ce + cfg.lam_distil * dlogits_kl
+            warm = max(0, step + 1 - cfg.distil_warmup)
+            distil_phase = float(np.clip(warm / max(1, cfg.distil_warmup), 0.0, 1.0))
+            ce_scale = float(cfg.ce_weight)
+            kl_scale = float(cfg.lam_distil * cfg.kl_weight * distil_phase)
+            dlogits = ce_scale * dlogits_ce + kl_scale * dlogits_kl
 
             # dCE/dT * dT/dSigma (optional)
             dSigma_T = None
@@ -1278,6 +1365,7 @@ class SpiralV9:
                              hazard_teach=float(hazard_teach.mean()), hazard_teach_all=hazard_teach.tolist(),
                              hazard_grad=float(hazard_grad.mean()), hazard_grad_all=hazard_grad.tolist(),
                              embed_dnorm=embed_delta, embed_gnorm=embed_gnorm,
+                             ce_scale=ce_scale, kl_scale=kl_scale, distil_phase=distil_phase,
                              **rag_stats)
             if train_tokens is not None and ((step + 1) % cfg.eval_every == 0 or (step + 1) == cfg.steps):
                 eval_train = self._eval_split(eval_train_ctx, eval_train_y, cfg.batch) if eval_train_ctx is not None else None
@@ -1336,6 +1424,8 @@ def demo(args=None):
     p.add_argument("--text_path", type=str, default=None, help="optional utf-8 text file to train tokenizer + dataset")
     p.add_argument("--tok_vocab", type=int, default=256, help="tokenizer vocab size target when using text_path")
     p.add_argument("--tok_min_freq", type=int, default=2, help="minimum pair frequency for BPE merges")
+    p.add_argument("--tok_word_topk", type=int, default=256, help="top-N full-word atoms to seed the tokenizer")
+    p.add_argument("--tok_word_min_freq", type=int, default=2, help="minimum frequency for full-word atoms")
     p.add_argument("--tok_lowercase", action="store_true", help="lowercase text before tokenization")
     p.add_argument("--tok_no_bos", action="store_true", help="disable adding BOS during tokenization")
     p.add_argument("--tok_no_eos", action="store_true", help="disable adding EOS during tokenization")
@@ -1348,6 +1438,10 @@ def demo(args=None):
     p.add_argument("--rng_seed", type=int, default=0, help="seed for sampler reproducibility")
     p.add_argument("--top_k", type=int, default=None, help="optional top-k cutoff before top-p (nucleus) sampling")
     p.add_argument("--log_path", type=str, default=None, help="optional JSON path to save training logs")
+    p.add_argument("--max_eval_windows", type=int, default=20000, help="cap evaluation windows to avoid OOM")
+    p.add_argument("--distil_warmup", type=int, default=5, help="warmup steps before enabling KL distillation")
+    p.add_argument("--ce_weight", type=float, default=1.0, help="scaling for CE loss term")
+    p.add_argument("--kl_weight", type=float, default=1.0, help="scaling for KL distillation term")
     parsed = p.parse_args(args=args)
 
     data_tokens = None
@@ -1364,6 +1458,7 @@ def demo(args=None):
         with open(parsed.text_path, "r", encoding="utf-8") as f:
             text = f.read()
         tok_cfg = TokenizerCfg(vocab_size=parsed.tok_vocab, min_freq=parsed.tok_min_freq,
+                               word_topk=parsed.tok_word_topk, word_min_freq=parsed.tok_word_min_freq,
                                add_bos=not parsed.tok_no_bos, add_eos=not parsed.tok_no_eos,
                                lowercase=parsed.tok_lowercase)
         tokenizer = SpiralTokenizer(tok_cfg)
@@ -1395,9 +1490,11 @@ def demo(args=None):
     logs: List[Dict[str, float]] = []
     if parsed.steps > 0:
         cfg = TrainCfg(steps=parsed.steps, batch=parsed.batch, ctx_len=parsed.ctx_len,
-                       valid_frac=parsed.valid_frac, eval_every=parsed.eval_every,
+                       valid_frac=parsed.valid_frac, eval_every=parsed.eval_every, max_eval_windows=parsed.max_eval_windows,
                        T0=1.0, lam=1.0, gamma=1.0, Tmin=0.7, Tmax=1.8, topk=48,
-                       lam_distil=0.1, lr_k_stab=0.02, lr_k_expl=0.01,
+                       lam_distil=0.1, distil_warmup=parsed.distil_warmup,
+                       ce_weight=parsed.ce_weight, kl_weight=parsed.kl_weight,
+                       lr_k_stab=0.02, lr_k_expl=0.01,
                        keepk_boost=2, rho_boost=0.0, backprop_T=True, T_grad_scale=0.1,
                        data_path=parsed.data_path)
         logs = eng.train(cfg, data_tokens=data_tokens)
