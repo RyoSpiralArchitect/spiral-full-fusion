@@ -438,26 +438,6 @@ def unpack_trigram(packed: Optional[Dict[str, np.ndarray]]) -> Optional[Dict[Tup
         return {}
     return {(int(a), int(b)): vals[i].astype(np.float32) for i, (a, b) in enumerate(keys)}
 
-def pack_trigram(tri: Optional[Dict[Tuple[int, int], np.ndarray]], V: int) -> Optional[Dict[str, np.ndarray]]:
-    if tri is None:
-        return None
-    if len(tri) == 0:
-        return dict(keys=np.zeros((0, 2), dtype=np.int64), vals=np.zeros((0, V), dtype=np.float32))
-    keys = np.array(list(tri.keys()), dtype=np.int64)
-    vals = np.stack([tri[tuple(k)] for k in keys], axis=0).astype(np.float32)
-    return dict(keys=keys, vals=vals)
-
-def unpack_trigram(packed: Optional[Dict[str, np.ndarray]]) -> Optional[Dict[Tuple[int, int], np.ndarray]]:
-    if packed is None:
-        return None
-    keys = packed.get("keys", None)
-    vals = packed.get("vals", None)
-    if keys is None or vals is None:
-        return None
-    if keys.shape[0] == 0:
-        return {}
-    return {(int(a), int(b)): vals[i].astype(np.float32) for i, (a, b) in enumerate(keys)}
-
 def _line_spans_from_bos_eos(data: np.ndarray, ctx_len: int, bos_id: int = 2, eos_id: int = 3) -> List[Tuple[int, int]]:
     # Extract contiguous spans [bos_idx, eos_idx] that are long enough for a ctx_len+1 window.
     spans: List[Tuple[int, int]] = []
@@ -1506,6 +1486,7 @@ def demo(args=None):
     p.add_argument("--kl_weight", type=float, default=1.0, help="scaling for KL distillation term")
     p.add_argument("--rag_m", type=int, default=8, help="top-m RAG sources to fuse from n-gram prior")
     p.add_argument("--rag_w", type=float, default=1.5, help="logit boost weight for n-gram RAG suggestions")
+    p.add_argument("--override_rag", action="store_true", help="override loaded teacher rag_m/rag_w with CLI values")
     parsed = p.parse_args(args=args)
 
     data_tokens = None
@@ -1542,6 +1523,10 @@ def demo(args=None):
     else:
         eng = SpiralV9(V=vocab_override, d=parsed.d, H=parsed.H, L=parsed.L, r=parsed.r,
                        seed=parsed.seed, teacher_cfg=teacher_cfg)
+
+    if parsed.override_rag:
+        eng.teacher.cfg.rag_m = parsed.rag_m
+        eng.teacher.cfg.rag_w = parsed.rag_w
 
     if tokenizer is not None and eng.tokenizer is None:
         eng.set_tokenizer(tokenizer)
