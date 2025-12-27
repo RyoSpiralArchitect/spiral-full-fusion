@@ -1624,8 +1624,8 @@ class TrainCfg:
     eval_every: int = 10
     max_eval_windows: int = 20000
     debug_nll_every: int = 0  # if >0, print fixed-T=1 metrics every N steps
-    # student T hyper
-    T0: float = 1.0; lam: float = 1.0; gamma: float = 1.0; Tmin: float = 0.7; Tmax: float = 1.8; topk: int = 40
+    # student T hyper (wider movable range + stronger meanVar coupling)
+    T0: float = 1.0; lam: float = 1.2; gamma: float = 1.2; Tmin: float = 0.6; Tmax: float = 2.0; topk: int = 40
     # distillation weight (single membrane for compactness)
     lam_distil: float = 0.2
     distil_warmup: int = 20     # steps before blending in KL
@@ -1637,11 +1637,15 @@ class TrainCfg:
     trace_every: int = 0   # 0なら無効
     trace_k: int = 8
     # reliability → rho nudging
-    lr_k_stab: float = 0.02; lr_k_expl: float = 0.01
+    lr_k_stab: float = 0.03; lr_k_expl: float = 0.01
     # hazard → partial optimize
-    keepk_boost: int = 1; rho_boost: float = 0.0
+    keepk_boost: int = 2; rho_boost: float = 0.02
+    hazard_grad_scale: float = 0.02
+    hazard_high_thr: float = 0.5; hazard_low_thr: float = 0.3
+    keepk_jitter_every: int = 0   # >0 なら数ステップごとに±1揺らす
+    keepk_jitter_mag: int = 1
     # T backprop switch & scale
-    backprop_T: bool = True; T_grad_scale: float = 0.1
+    backprop_T: bool = True; T_grad_scale: float = 0.2
     # logits are tiny by design; multiply for numerically healthy softmax
     logit_gain: float = -1.0  # <=0 enables auto gain based on logit std
 
@@ -2055,17 +2059,22 @@ class SpiralV9:
             hazard_grad = hazard_teach.copy()           # gradient-derived proxy for control
             for l_t in range(self.teacher.L):
                 idx = min(l_t, grad_layers.shape[0]-1)
-                hazard_grad[l_t] = float(np.clip(grad_layers[idx] / 0.02, 0.0, 1.0))
+                hazard_grad[l_t] = float(np.clip(grad_layers[idx] / cfg.hazard_grad_scale, 0.0, 1.0))
             keepk_new = self.student._keepk.copy()
             keepk_step = max(1, int(round(cfg.keepk_boost)))
             for l in range(self.student.cfg.L):
                 l_t = min(l, self.teacher.L - 1)
                 hg = hazard_grad[l_t]
-                if hg > 0.6:
+                if hg > cfg.hazard_high_thr:
                     keepk_new[l] = int(np.clip(keepk_new[l] + keepk_step, 2, self.student.cfg.k))
                     self.student.u.rho[l] += cfg.rho_boost  # reduce LR
-                elif hg < 0.2:
+                elif hg < cfg.hazard_low_thr:
                     keepk_new[l] = int(np.clip(keepk_new[l] - keepk_step, 2, self.student.cfg.k))
+                # optional periodic jitter to avoid sticking
+                if cfg.keepk_jitter_every > 0 and ((step + 1) % cfg.keepk_jitter_every == 0):
+                    jitter = int(np.clip(cfg.keepk_jitter_mag, 1, self.student.cfg.k))
+                    direction = -1 if (step // cfg.keepk_jitter_every) % 2 == 0 else 1
+                    keepk_new[l] = int(np.clip(keepk_new[l] + direction * jitter, 2, self.student.cfg.k))
             # re-clamp after hazard nudging to prevent runaway shrinkage of learning rate
             self.student.u.rho = np.clip(self.student.u.rho, -2.0, 2.0)
             self.student.u.rho *= 0.999
