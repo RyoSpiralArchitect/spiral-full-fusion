@@ -1045,7 +1045,8 @@ class SpiralV9:
         return eng
 
     def generate(self, prompt_ids: np.ndarray, max_new_tokens: int = 32,
-                 temperature: float = 1.0, top_p: float = 0.9, rng_seed: Optional[int] = None) -> np.ndarray:
+                 temperature: float = 1.0, top_p: float = 0.9, top_k: Optional[int] = None,
+                 rng_seed: Optional[int] = None) -> np.ndarray:
         rng = np.random.default_rng(rng_seed)
         tokens = prompt_ids.astype(np.int64).reshape(1, -1)
         eos_id = getattr(self.tokenizer, "eos_id", 3)
@@ -1059,6 +1060,10 @@ class SpiralV9:
             sorted_p = p[sorted_idx]
             cdf = np.cumsum(sorted_p)
             cutoff = sorted_p[cdf <= top_p]
+            if top_k is not None and top_k > 0:
+                sorted_idx = sorted_idx[:top_k]
+                sorted_p = sorted_p[:top_k]
+                cutoff = sorted_p[cdf[:top_k] <= top_p]
             if cutoff.size == 0:
                 chosen_idx = sorted_idx[0]
             else:
@@ -1071,10 +1076,11 @@ class SpiralV9:
         return tokens[0]
 
     def generate_text(self, prompt: str, tokenizer: SpiralTokenizer, max_new_tokens: int = 32,
-                      temperature: float = 1.0, top_p: float = 0.9, rng_seed: Optional[int] = None) -> str:
+                      temperature: float = 1.0, top_p: float = 0.9, top_k: Optional[int] = None,
+                      rng_seed: Optional[int] = None) -> str:
         ids = tokenizer.encode(prompt, add_special_tokens=True)
         gen = self.generate(ids[None, :], max_new_tokens=max_new_tokens,
-                            temperature=temperature, top_p=top_p, rng_seed=rng_seed)
+                            temperature=temperature, top_p=top_p, top_k=top_k, rng_seed=rng_seed)
         return tokenizer.decode(gen)
 
     def train(self, cfg: TrainCfg, data_tokens: Optional[np.ndarray] = None) -> List[Dict[str, float]]:
@@ -1212,6 +1218,7 @@ def demo(args=None):
     p.add_argument("--temperature", type=float, default=1.0, help="sampling temperature")
     p.add_argument("--top_p", type=float, default=0.9, help="top-p nucleus threshold for sampling")
     p.add_argument("--rng_seed", type=int, default=0, help="seed for sampler reproducibility")
+    p.add_argument("--top_k", type=int, default=None, help="optional top-k cutoff before top-p (nucleus) sampling")
     parsed = p.parse_args(args=args)
 
     data_tokens = None
@@ -1259,24 +1266,24 @@ def demo(args=None):
         print(f"Re-saved weights to {parsed.save_path}")
 
     # Inference / decoder
-    if parsed.prompt is not None:
-        rng_seed = parsed.rng_seed
-        prompt_is_ids = _looks_like_id_list(parsed.prompt)
-        if eng.tokenizer is not None and not prompt_is_ids:
-            text = eng.generate_text(parsed.prompt, eng.tokenizer,
-                                     max_new_tokens=parsed.max_new_tokens,
-                                     temperature=parsed.temperature, top_p=parsed.top_p,
-                                     rng_seed=rng_seed)
-            print(">> generated text:", text)
-        else:
-            try:
-                ids = np.array([int(x) for x in parsed.prompt.split(",") if x.strip() != ""], dtype=np.int64) if prompt_is_ids else \
+        if parsed.prompt is not None:
+            rng_seed = parsed.rng_seed
+            prompt_is_ids = _looks_like_id_list(parsed.prompt)
+            if eng.tokenizer is not None and not prompt_is_ids:
+                text = eng.generate_text(parsed.prompt, eng.tokenizer,
+                                         max_new_tokens=parsed.max_new_tokens,
+                                         temperature=parsed.temperature, top_p=parsed.top_p, top_k=parsed.top_k,
+                                         rng_seed=rng_seed)
+                print(">> generated text:", text)
+            else:
+                try:
+                    ids = np.array([int(x) for x in parsed.prompt.split(",") if x.strip() != ""], dtype=np.int64) if prompt_is_ids else \
                       np.array([min(b, eng.V - 1) for b in parsed.prompt.encode("utf-8")], dtype=np.int64)
-            except ValueError:
-                raise ValueError("Provide a tokenizer or pass comma-separated token ids for prompt")
-            gen = eng.generate(ids, max_new_tokens=parsed.max_new_tokens,
-                               temperature=parsed.temperature, top_p=parsed.top_p, rng_seed=rng_seed)
-            print(">> generated token ids:", gen.tolist())
+                except ValueError:
+                    raise ValueError("Provide a tokenizer or pass comma-separated token ids for prompt")
+                gen = eng.generate(ids, max_new_tokens=parsed.max_new_tokens,
+                                   temperature=parsed.temperature, top_p=parsed.top_p, top_k=parsed.top_k, rng_seed=rng_seed)
+                print(">> generated token ids:", gen.tolist())
 
     print("== SpiralFullFusion V9 (compact) Demo — DONE ==")
     return logs
