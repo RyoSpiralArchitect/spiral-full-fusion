@@ -674,7 +674,6 @@ class TeacherCfg:
     rag_m: int = 8
     rag_w: float = 1.5
     logit_gain: float = -1.0  # <=0 enables auto gain based on logit std
-    logit_gain: float = 200.0
 
 # ------------------------------
 # Episodic Memory (kNN-RAG): key=rank mu (r-dim), value=sparse next-token distribution (top-m probs)
@@ -1624,6 +1623,7 @@ class TrainCfg:
     valid_frac: float = 0.1
     eval_every: int = 10
     max_eval_windows: int = 20000
+    debug_nll_every: int = 0  # if >0, print fixed-T=1 metrics every N steps
     # student T hyper
     T0: float = 1.0; lam: float = 1.0; gamma: float = 1.0; Tmin: float = 0.7; Tmax: float = 1.8; topk: int = 40
     # distillation weight (single membrane for compactness)
@@ -1763,7 +1763,7 @@ class SpiralV9:
         eos_id = getattr(self.tokenizer, "eos_id", 3)
 
         for tgen in range(max_new_tokens):
-            logits, aux = self.student.forward(tokens)  # logits: [1,V]
+            logits, aux = self.student.forward(tokens, logit_gain=self.logit_gain)  # logits: [1,V]
 
             # ---- memory boost in logit-space (student_mem) ----
             inds_m = None
@@ -2088,6 +2088,14 @@ class SpiralV9:
             rag_stats = dict(rag_min=float(rag_w.min()), rag_max=float(rag_w.max()), rag_mean=float(rag_w.mean()))
             ece = expected_calibration_error(p_s, y, n_bins=15)
             brier = brier_score(p_s, y)
+            dbg_nll = dbg_acc = dbg_uniform = dbg_oracle = None
+            if cfg.debug_nll_every > 0 and ((step + 1) % cfg.debug_nll_every == 0):
+                p1 = softmax_rows(s_logits)  # fixed T=1.0 view of student
+                dbg_nll = float(-np.log(np.maximum(p1[np.arange(Bn), y], 1e-12)).mean())
+                dbg_uniform = float(np.log(self.V))
+                dbg_oracle = float(-np.log(np.maximum(self.P[ctx[:, -1], y], 1e-12)).mean())
+                dbg_acc = float((np.argmax(p1, axis=1) == y).mean())
+                print(f\"[dbg step {step+1}] nll@T1={dbg_nll:.4f} oracle={dbg_oracle:.4f} uniform={dbg_uniform:.4f} acc@T1={dbg_acc:.3f} gain={self.logit_gain:.1f}\")
             log_entry = dict(step=step+1, CE=float(ce), KL=float(kl),
                              ECE=float(ece), brier=float(brier),
                              T=float(T_S.mean()), var=float(meanVars.mean()),
@@ -2105,6 +2113,7 @@ class SpiralV9:
                              mem_punish_frac=float(meta.get("mem_punish_frac", 0.0)),
                              embed_dnorm=embed_delta, embed_gnorm=embed_gnorm,
                              ce_scale=ce_scale, kl_scale=kl_scale, distil_phase=distil_phase,
+                             dbg_nll=dbg_nll, dbg_acc=dbg_acc, dbg_uniform=dbg_uniform, dbg_oracle=dbg_oracle,
                              **rag_stats)
             if train_tokens is not None and ((step + 1) % cfg.eval_every == 0 or (step + 1) == cfg.steps):
                 eval_train = self._eval_split(eval_train_ctx, eval_train_y, cfg.batch) if eval_train_ctx is not None else None
