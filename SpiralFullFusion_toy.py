@@ -1140,7 +1140,7 @@ class TrainCfg:
     T0: float = 1.0; lam: float = 1.0; gamma: float = 1.0; Tmin: float = 0.7; Tmax: float = 1.8; topk: int = 40
     # distillation weight (single membrane for compactness)
     lam_distil: float = 0.1
-    distil_warmup: int = 5     # steps before blending in KL
+    distil_warmup: int = 20     # steps before blending in KL
     ce_weight: float = 1.0
     kl_weight: float = 1.0
     # reliability → rho nudging
@@ -1383,7 +1383,7 @@ class SpiralV9:
             grad_layers = self.student.grad_rms()
             for l_t in range(self.teacher.L):
                 idx = min(l_t, grad_layers.shape[0]-1)
-                hazard_grad[l_t] = float(np.clip(grad_layers[idx] / 0.2, 0.0, 1.0))
+                hazard_grad[l_t] = float(np.clip(grad_layers[idx] / 0.02, 0.0, 1.0))
             keepk_new = self.student._keepk.copy()
             for l in range(self.student.cfg.L):
                 l_t = min(l, self.teacher.L - 1)
@@ -1482,7 +1482,7 @@ def demo(args=None):
     p.add_argument("--top_k", type=int, default=None, help="optional top-k cutoff before top-p (nucleus) sampling")
     p.add_argument("--log_path", type=str, default=None, help="optional JSON path to save training logs")
     p.add_argument("--max_eval_windows", type=int, default=20000, help="cap evaluation windows to avoid OOM")
-    p.add_argument("--distil_warmup", type=int, default=5, help="warmup steps before enabling KL distillation")
+    p.add_argument("--distil_warmup", type=int, default=20, help="warmup steps before enabling KL distillation")
     p.add_argument("--ce_weight", type=float, default=1.0, help="scaling for CE loss term")
     p.add_argument("--kl_weight", type=float, default=1.0, help="scaling for KL distillation term")
     p.add_argument("--rag_m", type=int, default=8, help="top-m RAG sources to fuse from n-gram prior")
