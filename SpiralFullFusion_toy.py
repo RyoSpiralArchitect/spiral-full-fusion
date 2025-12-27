@@ -657,6 +657,213 @@ class TeacherCfg:
     rag_m: int = 8
     rag_w: float = 1.5
 
+# ------------------------------
+# Episodic Memory (kNN-RAG): key=rank mu (r-dim), value=sparse next-token distribution (top-m probs)
+# ------------------------------
+@dataclass
+class MemoryCfg:
+    enable: bool = True
+    max_size: int = 4096         # memory capacity
+    store_m: int = 8             # store top-m tokens per entry
+    retrieve_k: int = 16         # retrieve top-k nearest entries
+    sim_temp: float = 0.07       # softmax temperature for neighbor weighting
+    min_sim: float = 0.20        # if best similarity < min_sim -> don't use memory
+    logit_scale: float = 2.5     # how strongly memory distribution boosts logits
+    decay: float = 0.9995        # global strength decay per teacher.forward_batch call
+    touch_alpha: float = 0.05    # strengthen retrieved entries
+    max_strength: float = 3.0
+
+    # insertion gating (only during training when targets are available)
+    add_rate: float = 0.50       # subsample insertions (0..1)
+    add_prob_thr: float = 0.35   # insert only if teacher prob(y) >= thr
+    add_T_thr: float = 1.20      # and teacher temperature <= thr
+    min_store_prob: float = 0.02 # if target not in top-m, force-insert with at least this prob
+
+
+class EpisodicMemory:
+    """
+    Fixed-size episodic memory:
+      - key: normalized r-dim vector (e.g., teacher mu_post)
+      - value: top-m token ids + probs (renormalized over top-m)
+    Retrieval: cosine similarity topK -> weighted mixture -> sparse logit delta.
+    """
+
+    def __init__(self, r: int, V: int, cfg: MemoryCfg, seed: int = 0):
+        self.r = int(r)
+        self.V = int(V)
+        self.cfg = cfg
+        self._rng = np.random.default_rng(seed)
+
+        M = int(max(1, cfg.max_size))
+        m = int(max(1, cfg.store_m))
+
+        self.keys = np.zeros((M, self.r), dtype=np.float32)        # normalized keys
+        self.idx = -np.ones((M, m), dtype=np.int64)                # token ids (top-m)
+        self.val = np.zeros((M, m), dtype=np.float32)              # probs (top-m, renorm)
+        self.strength = np.zeros((M,), dtype=np.float32)           # entry strength
+        self.used = np.zeros((M,), dtype=np.int32)                 # usage count
+
+        self.ptr = 0                                               # ring pointer
+        self.size = 0                                              # current #entries
+
+    def _norm(self, x: np.ndarray) -> np.ndarray:
+        n = float(np.linalg.norm(x) + EPS)
+        return (x / n).astype(np.float32)
+
+    def decay(self):
+        if self.size <= 0:
+            return
+        if self.cfg.decay >= 1.0:
+            return
+        self.strength[:self.size] *= float(self.cfg.decay)
+        self.strength[:self.size] = np.clip(self.strength[:self.size], 0.0, float(self.cfg.max_strength))
+
+    def touch(self, mem_idx: np.ndarray):
+        if mem_idx is None or mem_idx.size == 0:
+            return
+        mem_idx = mem_idx.astype(np.int64)
+        s = self.strength[mem_idx]
+        s = s + float(self.cfg.touch_alpha)
+        self.strength[mem_idx] = np.clip(s, 0.0, float(self.cfg.max_strength))
+        self.used[mem_idx] += 1
+
+    def build_payload_from_probs(self, probs: np.ndarray, y: int) -> Tuple[np.ndarray, np.ndarray]:
+        # probs: [V]
+        V = probs.shape[0]
+        m = int(max(1, min(self.cfg.store_m, V)))
+        top = np.argpartition(probs, -m)[-m:]
+        # sort descending
+        top = top[np.argsort(probs[top])[::-1]]
+        vals = probs[top].astype(np.float32)
+
+        y = int(np.clip(y, 0, V - 1))
+        if (top == y).sum() == 0:
+            # replace the smallest
+            j = int(np.argmin(vals))
+            top[j] = y
+            vals[j] = max(float(probs[y]), float(self.cfg.min_store_prob))
+
+        # renormalize over stored top-m
+        vals = vals / float(np.maximum(vals.sum(), EPS))
+
+        # pad to store_m (if V < store_m)
+        idx_full = -np.ones((self.cfg.store_m,), dtype=np.int64)
+        val_full = np.zeros((self.cfg.store_m,), dtype=np.float32)
+        idx_full[:m] = top.astype(np.int64)
+        val_full[:m] = vals.astype(np.float32)
+        return idx_full, val_full
+
+    def add(self, key_r: np.ndarray, idx_m: np.ndarray, val_m: np.ndarray):
+        if not self.cfg.enable:
+            return
+        if idx_m is None or val_m is None:
+            return
+        if self.cfg.max_size <= 0:
+            return
+
+        k = self._norm(key_r.astype(np.float32).reshape(-1))
+        i = self.ptr if self.size >= self.cfg.max_size else self.size
+
+        self.keys[i] = k
+        self.idx[i] = idx_m.astype(np.int64)
+        self.val[i] = val_m.astype(np.float32)
+        self.strength[i] = float(self.cfg.max_strength) * 0.33  # start not too hot
+        self.used[i] = 0
+
+        if self.size < self.cfg.max_size:
+            self.size += 1
+        else:
+            self.ptr = (self.ptr + 1) % int(self.cfg.max_size)
+
+    def retrieve(self, query_r: np.ndarray, scale: Optional[float] = None) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Dict[str, Any]]:
+        if (not self.cfg.enable) or self.size <= 0:
+            return None, None, dict(used=False, max_sim=0.0, mem_idx=np.zeros((0,), dtype=np.int64))
+
+        q = self._norm(query_r.astype(np.float32).reshape(-1))
+        keys = self.keys[:self.size]  # [N,r]
+        sim = safe_matmul(keys, q.astype(np.float32))            # [N]
+        sim = np.array(sim, dtype=np.float32).reshape(-1)
+
+        # strength modulation (weak entries matter less)
+        s = np.clip(self.strength[:self.size], 0.0, float(self.cfg.max_strength))
+        sim_eff = sim * (0.5 + s)
+
+        max_sim = float(sim_eff.max()) if sim_eff.size > 0 else 0.0
+        if max_sim < float(self.cfg.min_sim):
+            return None, None, dict(used=False, max_sim=max_sim, mem_idx=np.zeros((0,), dtype=np.int64))
+
+        K = int(max(1, min(self.cfg.retrieve_k, self.size)))
+        top_mem = np.argpartition(sim_eff, -K)[-K:]
+        top_sim = sim_eff[top_mem].astype(np.float32)
+
+        temp = float(max(self.cfg.sim_temp, 1e-4))
+        w = softmax_rows((top_sim[None, :] / temp).astype(np.float32))[0]  # [K]
+
+        # weighted mixture of sparse distributions
+        acc: Dict[int, float] = {}
+        m = self.idx.shape[1]
+        for wi, mi in zip(w.tolist(), top_mem.tolist()):
+            if wi <= 0.0:
+                continue
+            idxs = self.idx[mi]
+            vals = self.val[mi]
+            for j in range(m):
+                tid = int(idxs[j])
+                if tid < 0:
+                    continue
+                if tid >= self.V:
+                    continue
+                acc[tid] = acc.get(tid, 0.0) + float(wi) * float(vals[j])
+
+        if not acc:
+            return None, None, dict(used=False, max_sim=max_sim, mem_idx=top_mem.astype(np.int64))
+
+        inds = np.array(list(acc.keys()), dtype=np.int64)
+        vals = np.array([acc[i] for i in inds.tolist()], dtype=np.float32)
+
+        sc = float(self.cfg.logit_scale if scale is None else scale)
+        vals = (vals * sc).astype(np.float32)
+        return inds, vals, dict(used=True, max_sim=max_sim, mem_idx=top_mem.astype(np.int64))
+
+    def state_dict(self) -> Dict[str, Any]:
+        return dict(
+            keys=self.keys.copy(),
+            idx=self.idx.copy(),
+            val=self.val.copy(),
+            strength=self.strength.copy(),
+            used=self.used.copy(),
+            ptr=np.array(self.ptr, dtype=np.int32),
+            size=np.array(self.size, dtype=np.int32),
+        )
+
+    def load_state(self, state: Dict[str, Any]):
+        # robust load even if cfg/max_size changed
+        if state is None:
+            return
+        size = int(np.array(state.get("size", 0)).item())
+        ptr = int(np.array(state.get("ptr", 0)).item())
+
+        keys = state.get("keys", None)
+        idx = state.get("idx", None)
+        val = state.get("val", None)
+        strength = state.get("strength", None)
+        used = state.get("used", None)
+
+        if keys is None or idx is None or val is None:
+            return
+
+        n = int(min(size, self.cfg.max_size, keys.shape[0]))
+        self.size = n
+        self.ptr = int(ptr % max(1, self.cfg.max_size))
+
+        self.keys[:n] = keys[:n].astype(np.float32)
+        self.idx[:n] = idx[:n].astype(np.int64)
+        self.val[:n] = val[:n].astype(np.float32)
+        if strength is not None:
+            self.strength[:n] = strength[:n].astype(np.float32)
+        if used is not None:
+            self.used[:n] = used[:n].astype(np.int32)
+
 class SpiralTeacher:
     def __init__(self, V: int, d: int, H: int, L: int, r: int, P: np.ndarray, cfg: TeacherCfg, seed: int = 0):
         self.V, self.d, self.H, self.L, self.r = V, d, H, L, r
@@ -671,6 +878,9 @@ class SpiralTeacher:
         self.rel = ReliabilityTracker(L, H, ema=0.7)
         # rag source weights (per vocab id) for SHAP attenuation
         self.rag_src_weight = np.ones((V,), dtype=np.float32)
+        # ---- episodic memory (kNN-RAG) ----
+        self.mem_cfg = MemoryCfg()
+        self.mem = EpisodicMemory(r=self.r, V=self.V, cfg=self.mem_cfg, seed=seed + 999)
 
     def _rag_rank_mu_delta(self, indices: np.ndarray, scores: np.ndarray) -> Optional[np.ndarray]:
         if indices.size == 0: return None
@@ -693,7 +903,9 @@ class SpiralTeacher:
             contrib[j_idx] = contrib.get(j_idx, 0.0) + abs(float(sc)) * rel_scale
         return contrib
 
-    def forward_batch(self, tokens_batch: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Dict[str, Any]]:
+    def forward_batch(self, tokens_batch: np.ndarray,
+                      targets: Optional[np.ndarray] = None,
+                      update_memory: bool = False) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Dict[str, Any]]:
         Bn = tokens_batch.shape[0]
         logits = np.zeros((Bn, self.V), dtype=np.float32)
         Ts = np.zeros((Bn, 1), dtype=np.float32)
@@ -704,6 +916,13 @@ class SpiralTeacher:
 
         # reliability accumulators for RAG SHAP
         rag_attr: Dict[int, float] = {}
+
+        # memory stats
+        mem_used = 0
+        mem_maxsim_sum = 0.0
+
+        if getattr(self, "mem_cfg", None) is not None and self.mem_cfg.enable:
+            self.mem.decay()
 
         for b in range(Bn):
             HPL = self.lm.encode_heads_per_layer(tokens_batch[b])
@@ -748,12 +967,45 @@ class SpiralTeacher:
                     # recompute logits after rank injection
                     logits_b = self.fusers[-1].logits_from_mu(mu_post)
 
+            # ---- episodic memory retrieve (kNN-RAG) ----
+            logits_pre_mem = logits_b.copy() if (update_memory and targets is not None) else None
+            mu_key = mu_post.copy()  # store/retrieve key BEFORE memory injection (avoid self-reinforcement)
+
+            if hasattr(self, "mem_cfg") and self.mem_cfg.enable and hasattr(self, "mem"):
+                inds_m, vals_m, info_m = self.mem.retrieve(mu_key)
+                if inds_m is not None and inds_m.size > 0:
+                    logits_b[inds_m] += vals_m
+
+                    # optional: rank-space injection like n-gram (keeps internal story coherent)
+                    mu_dm = self._rag_rank_mu_delta(inds_m, vals_m)
+                    if mu_dm is not None:
+                        mu_post = (mu_post + mu_dm).astype(np.float32)
+                        logits_b = self.fusers[-1].logits_from_mu(mu_post)
+
+                    # strengthen retrieved memories
+                    mem_used += 1
+                    mem_maxsim_sum += float(info_m.get("max_sim", 0.0))
+                    self.mem.touch(info_m.get("mem_idx", np.zeros((0,), dtype=np.int64)))
+
             # variance on top-k
             var_logits = self.fusers[-1].variance_full_logits(var_post)  # [V]
             k = min(self.cfg.topk, self.V)
             idx = np.argpartition(logits_b, -k)[-k:]
             mean_var = float(np.mean(var_logits[idx]))
             T = float(np.clip(self.cfg.T0 * (1.0 + self.cfg.lam * mean_var) ** self.cfg.gamma, self.cfg.Tmin, self.cfg.Tmax))
+
+            # ---- episodic memory insert (training only) ----
+            if update_memory and targets is not None and hasattr(self, "mem_cfg") and self.mem_cfg.enable and hasattr(self, "mem"):
+                if self.mem._rng.random() < float(self.mem_cfg.add_rate):
+                    yb = int(targets[b])
+                    # gating by teacher confidence (use logits BEFORE memory, so insert isn't boosted by memory itself)
+                    base_logits = logits_pre_mem if logits_pre_mem is not None else logits_b
+                    qprob = softmax_rows((base_logits[None, :] / max(T, 1e-6)).astype(np.float32))[0]
+                    py = float(qprob[yb])
+
+                    if (py >= float(self.mem_cfg.add_prob_thr)) and (T <= float(self.mem_cfg.add_T_thr)):
+                        idx_m, val_m = self.mem.build_payload_from_probs(qprob, yb)
+                        self.mem.add(mu_key, idx_m, val_m)
 
             logits[b] = logits_b; Ts[b, 0] = T; meanVars[b] = mean_var
 
@@ -776,7 +1028,20 @@ class SpiralTeacher:
             decay = np.exp(-1.5 * vals)  # higher attribution ⇒ stronger decay
             self.rag_src_weight[keys] = np.clip(self.rag_src_weight[keys] * decay, 0.2, 1.0)
 
-        meta = dict(meanVar=float(meanVars.mean()), layer_hazard=layer_hazard, keepk_suggest=keepk_suggest)
+        mem_size = int(getattr(self, "mem", None).size) if hasattr(self, "mem") else 0
+        mem_used_frac = float(mem_used) / max(1, tokens_batch.shape[0])
+        mem_mean_maxsim = float(mem_maxsim_sum) / max(1, mem_used) if mem_used > 0 else 0.0
+        mem_mean_strength = float(np.mean(self.mem.strength[:self.mem.size])) if (hasattr(self, "mem") and self.mem.size > 0) else 0.0
+
+        meta = dict(
+            meanVar=float(meanVars.mean()),
+            layer_hazard=layer_hazard,
+            keepk_suggest=keepk_suggest,
+            mem_size=mem_size,
+            mem_used_frac=mem_used_frac,
+            mem_mean_maxsim=mem_mean_maxsim,
+            mem_mean_strength=mem_mean_strength,
+        )
         return logits, Ts, meanVars, meta
 
     def state_dict(self) -> Dict[str, Any]:
@@ -788,6 +1053,8 @@ class SpiralTeacher:
             rel=self.rel.state_dict(),
             rag_src_weight=self.rag_src_weight.copy(),
             cfg=asdict(self.cfg),
+            mem_cfg=asdict(getattr(self, "mem_cfg", MemoryCfg())),
+            mem_state=(self.mem.state_dict() if hasattr(self, "mem") else None),
         )
 
     def load_state(self, state: Dict[str, Any]):
@@ -809,6 +1076,17 @@ class SpiralTeacher:
         self.B = B0
         self.rel.load_state(state["rel"])
         self.rag_src_weight = state.get("rag_src_weight", np.ones((self.V,), dtype=np.float32)).astype(np.float32)
+        # ---- memory restore ----
+        mem_cfg_state = state.get("mem_cfg", None)
+        if mem_cfg_state is not None:
+            self.mem_cfg = MemoryCfg(**mem_cfg_state)
+        else:
+            self.mem_cfg = MemoryCfg()
+
+        self.mem = EpisodicMemory(r=self.r, V=self.V, cfg=self.mem_cfg, seed=123)
+        mem_state = state.get("mem_state", None)
+        if mem_state is not None:
+            self.mem.load_state(mem_state)
 
 # ------------------------------
 # Student: Rank-K blocks + RankParamHead + UncertaintyLR + T_S(Σ) backprop (approx)
@@ -1430,7 +1708,7 @@ class SpiralV9:
             embed_prev = self.student.embed.W.copy()
 
             # teacher
-            t_logits, Ts, meanVars, meta = self.teacher.forward_batch(ctx)
+            t_logits, Ts, meanVars, meta = self.teacher.forward_batch(ctx, targets=y, update_memory=True)
 
             # student forward
             s_logits, aux = self.student.forward(ctx)
@@ -1512,6 +1790,10 @@ class SpiralV9:
                              hazard=float(hazard_grad.mean()),
                              hazard_teach=float(hazard_teach.mean()), hazard_teach_all=hazard_teach.tolist(),
                              hazard_grad=float(hazard_grad.mean()), hazard_grad_all=hazard_grad.tolist(),
+                             mem_size=float(meta.get("mem_size", 0)),
+                             mem_used_frac=float(meta.get("mem_used_frac", 0.0)),
+                             mem_mean_maxsim=float(meta.get("mem_mean_maxsim", 0.0)),
+                             mem_mean_strength=float(meta.get("mem_mean_strength", 0.0)),
                              embed_dnorm=embed_delta, embed_gnorm=embed_gnorm,
                              ce_scale=ce_scale, kl_scale=kl_scale, distil_phase=distil_phase,
                              **rag_stats)
