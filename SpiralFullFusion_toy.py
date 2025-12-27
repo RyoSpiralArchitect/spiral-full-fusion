@@ -166,7 +166,7 @@ class SpiralTokenizer:
         return top
 
     def _find_top_words(self, text: str) -> List[bytes]:
-        pattern = re.compile(r"[\\w']+")
+        pattern = re.compile(r"[\w']+")
         words = pattern.findall(text)
         counts: Dict[str, int] = {}
         for w in words:
