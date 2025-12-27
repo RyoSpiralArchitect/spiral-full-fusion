@@ -378,19 +378,36 @@ def sample_batch_from_array(data: np.ndarray, ctx_len: int, B: int, rng: np.rand
     y = np.clip(y, 0, V - 1)
     return ctx, y
 
-def build_ctx_target_pairs(tokens: np.ndarray, ctx_len: int, V: int, bos_id: int = 2, eos_id: int = 3) -> Tuple[np.ndarray, np.ndarray]:
+def build_ctx_target_pairs(tokens: np.ndarray, ctx_len: int, V: int, bos_id: int = 2, eos_id: int = 3,
+                           max_windows: Optional[int] = None, rng: Optional[np.random.Generator] = None) -> Tuple[np.ndarray, np.ndarray]:
     spans = _line_spans_from_bos_eos(tokens, ctx_len, bos_id=bos_id, eos_id=eos_id)
     ctxs: List[np.ndarray] = []; ys: List[int] = []
+    use_cap = max_windows is not None and max_windows > 0
+    rng_cap = rng if rng is not None else np.random.default_rng(0)
+    seen = 0
+
+    def maybe_add(window_ctx: np.ndarray, target: int, seen_so_far: int):
+        if not use_cap:
+            ctxs.append(window_ctx); ys.append(target)
+            return seen_so_far + 1
+        if len(ctxs) < max_windows:  # fill reservoir
+            ctxs.append(window_ctx); ys.append(target)
+        else:
+            j = int(rng_cap.integers(0, seen_so_far + 1))
+            if j < max_windows:
+                ctxs[j] = window_ctx; ys[j] = target
+        return seen_so_far + 1
+
     clipped = np.clip(tokens.astype(np.int64), 0, V - 1)
     if spans:
         for smin, smax in spans:
             for start in range(smin, smax - ctx_len):
                 window = clipped[start:start+ctx_len+1]
-                ctxs.append(window[:-1]); ys.append(int(window[-1]))
+                seen = maybe_add(window[:-1], int(window[-1]), seen)
     else:
         for start in range(0, clipped.shape[0] - ctx_len):
             window = clipped[start:start+ctx_len+1]
-            ctxs.append(window[:-1]); ys.append(int(window[-1]))
+            seen = maybe_add(window[:-1], int(window[-1]), seen)
     if not ctxs:
         return np.zeros((0, ctx_len), dtype=np.int64), np.zeros((0,), dtype=np.int64)
     return np.stack(ctxs, axis=0), np.array(ys, dtype=np.int64)
@@ -999,6 +1016,7 @@ class TrainCfg:
     data_path: Optional[str] = None  # optional npy file of token ids for local data
     valid_frac: float = 0.1
     eval_every: int = 10
+    max_eval_windows: int = 20000
     # student T hyper
     T0: float = 1.0; lam: float = 1.0; gamma: float = 1.0; Tmin: float = 0.7; Tmax: float = 1.8; topk: int = 40
     # distillation weight (single membrane for compactness)
@@ -1093,21 +1111,17 @@ class SpiralV9:
             logits = logits / max(temperature, 1e-4)
             probs = softmax_rows(logits)
             p = probs[0]
-            # nucleus sampling
+            # nucleus sampling with optional top-k truncation before top-p
             sorted_idx = np.argsort(p)[::-1]
-            sorted_p = p[sorted_idx]
-            cdf = np.cumsum(sorted_p)
-            cutoff = sorted_p[cdf <= top_p]
             if top_k is not None and top_k > 0:
                 sorted_idx = sorted_idx[:top_k]
-                sorted_p = sorted_p[:top_k]
-                cutoff = sorted_p[cdf[:top_k] <= top_p]
-            if cutoff.size == 0:
-                chosen_idx = sorted_idx[0]
-            else:
-                keep = sorted_idx[: cutoff.size + 1]
-                keep_p = p[keep]; keep_p = keep_p / np.maximum(keep_p.sum(), EPS)
-                chosen_idx = int(rng.choice(keep, p=keep_p))
+            sorted_p = p[sorted_idx]
+            cdf = np.cumsum(sorted_p)
+            keep_len = int(np.searchsorted(cdf, top_p, side="right"))
+            keep_len = max(1, keep_len)
+            keep = sorted_idx[:keep_len]
+            keep_p = p[keep] / np.maximum(p[keep].sum(), EPS)
+            chosen_idx = int(rng.choice(keep, p=keep_p))
             tokens = np.concatenate([tokens, np.array([[chosen_idx]], dtype=np.int64)], axis=1)
             if chosen_idx == eos_id:
                 break
@@ -1162,6 +1176,7 @@ class SpiralV9:
         eos_id = getattr(self.tokenizer, "eos_id", 3)
         train_tokens = None; valid_tokens = None
         eval_train_ctx = eval_train_y = eval_valid_ctx = eval_valid_y = None
+        eval_rng = np.random.default_rng(1234)
         if data_tokens is not None:
             flat = data_tokens.astype(np.int64).reshape(-1)
             train_tokens, valid_tokens = self._train_valid_split(flat, ctx_len=cfg.ctx_len,
@@ -1172,10 +1187,12 @@ class SpiralV9:
             self.P = bigram_from_tokens(train_tokens, self.V, bos_id=bos_id, eos_id=eos_id)
             self.teacher.P = self.P
             eval_train_ctx, eval_train_y = build_ctx_target_pairs(train_tokens, ctx_len=cfg.ctx_len, V=self.V,
-                                                                  bos_id=bos_id, eos_id=eos_id)
+                                                                  bos_id=bos_id, eos_id=eos_id,
+                                                                  max_windows=cfg.max_eval_windows, rng=eval_rng)
             if valid_tokens is not None and valid_tokens.shape[0] >= cfg.ctx_len + 1:
                 eval_valid_ctx, eval_valid_y = build_ctx_target_pairs(valid_tokens, ctx_len=cfg.ctx_len, V=self.V,
-                                                                      bos_id=bos_id, eos_id=eos_id)
+                                                                      bos_id=bos_id, eos_id=eos_id,
+                                                                      max_windows=cfg.max_eval_windows, rng=eval_rng)
         # initial keepk from teacher suggestion
         logits_dummy, Ts_dummy, mv_dummy, meta = self.teacher.forward_batch(np.zeros((1, cfg.ctx_len), dtype=np.int64))
         keepk = np.clip(meta["keepk_suggest"], 2, self.student.cfg.k).astype(np.int32)
