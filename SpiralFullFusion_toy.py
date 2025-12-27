@@ -2,10 +2,11 @@
 # -*- coding: utf-8 -*-
 # SpiralFullFusion Toy (compact complete) — reliability dynamics + partial optimization + RAG SHAP + T_S(Σ) backprop
 # NumPy-only, single-file demo. Safe initializations and eps clamps to avoid NaNs.
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from typing import List, Tuple, Optional, Dict, Any
 import numpy as np
 import re
+import importlib.util
 
 EPS = 1e-8
 
@@ -1468,6 +1469,83 @@ def _topk_probs(logits_row: np.ndarray, T: float, k: int = 8):
     idx = np.argsort(p)[::-1][:k]
     return [(int(i), float(p[i])) for i in idx]
 
+class MemoryHeatmapTracer:
+    def __init__(self, top_tokens: int = 32, max_steps: int = 200, interval_ms: int = 250, tokenizer=None):
+        self.top_tokens = int(max(1, top_tokens))
+        self.max_steps = int(max(8, max_steps))
+        self.tokenizer = tokenizer
+        self.step_count = 0
+        self.token_score: Dict[int, float] = {}
+        self.columns: List[int] = [-1 for _ in range(self.top_tokens)]
+        self.buffer = np.full((self.max_steps, self.top_tokens), np.nan, dtype=np.float32)
+        self.chosen = np.zeros((self.max_steps, self.top_tokens), dtype=np.float32)
+        self._dirty = True
+
+        spec = importlib.util.find_spec("matplotlib")
+        self.enabled = spec is not None
+        if not self.enabled:
+            self._err = "matplotlib is not installed; heatmap tracing disabled"
+            return
+        import matplotlib.pyplot as plt  # type: ignore
+        from matplotlib import animation  # type: ignore
+        self.plt = plt
+        self.animation = animation
+        self.fig, self.ax = plt.subplots(figsize=(max(6, self.top_tokens / 4), 6))
+        self.im = self.ax.imshow(np.zeros_like(self.buffer), aspect="auto", interpolation="nearest",
+                                 cmap="coolwarm", origin="lower", vmin=-1.0, vmax=1.0)
+        self.ax.set_xlabel("token (mem Δlogit)")
+        self.ax.set_ylabel("step (rolling window)")
+        self.ax.set_title("Episodic memory Δlogit heatmap")
+        self._tick_objs = []
+        self.ani = animation.FuncAnimation(self.fig, self._render, interval=interval_ms, blit=False)
+
+    def _token_label(self, tid: int) -> str:
+        if tid < 0:
+            return "-"
+        return _tok_str(self.tokenizer, tid)
+
+    def update(self, delta_map: Dict[int, float], chosen: Optional[int] = None):
+        if not self.enabled:
+            return
+        self.step_count += 1
+        # mild decay to keep obsolete tokens from pinning the grid
+        for k in list(self.token_score.keys()):
+            self.token_score[k] *= 0.97
+        for tid, dlt in delta_map.items():
+            self.token_score[tid] = self.token_score.get(tid, 0.0) * 0.9 + 0.1 * abs(float(dlt))
+
+        ranked = sorted(self.token_score.items(), key=lambda kv: kv[1], reverse=True)[: self.top_tokens]
+        self.columns = [tid for tid, _ in ranked] + [-1] * (self.top_tokens - len(ranked))
+
+        row = (self.step_count - 1) % self.max_steps
+        self.buffer[row].fill(np.nan)
+        self.chosen[row].fill(0.0)
+        for c, tid in enumerate(self.columns):
+            if tid in delta_map:
+                self.buffer[row, c] = float(delta_map[tid])
+            if chosen is not None and tid == chosen:
+                self.chosen[row, c] = 1.0
+        self._dirty = True
+        self._render(None)
+
+    def _render(self, _):
+        if not self.enabled or (not self._dirty and self.step_count > 0):
+            return
+        offset = 0
+        if self.step_count >= self.max_steps:
+            offset = self.step_count % self.max_steps
+        data = np.roll(self.buffer, -offset, axis=0)
+        vmax = np.nanmax(np.abs(data))
+        vmax = 1.0 if (not np.isfinite(vmax) or vmax < 1e-6) else float(vmax)
+        self.im.set_data(np.nan_to_num(data, nan=0.0))
+        self.im.set_clim(-vmax, vmax)
+        self.ax.set_xticks(range(self.top_tokens))
+        self.ax.set_xticklabels([self._token_label(tid) for tid in self.columns], rotation=45, ha="right")
+        self.ax.set_yticks(np.linspace(0, self.max_steps - 1, num=min(6, self.max_steps)))
+        self.ax.set_title(f"Episodic memory Δlogit heatmap (t={self.step_count})")
+        self._dirty = False
+        self.plt.pause(0.001)
+
 def _trace_step(step: int, ctx: np.ndarray, y: np.ndarray,
                 t_logits: np.ndarray, s_logits: np.ndarray,
                 T_s: np.ndarray, T_t: np.ndarray, meanVar_t: np.ndarray,
@@ -1613,6 +1691,55 @@ def dTdSigma(B: np.ndarray, logits: np.ndarray, Sigma: np.ndarray,
         dT_dSigma[clamped[:, 0]] = 0.0
     return dT_dSigma.astype(np.float32)
 
+@dataclass
+class HazardBanditCfg:
+    enable: bool = False
+    epsilon: float = 0.10
+    reward_ema: float = 0.9
+    reward_scale: float = 1.0
+    bonus_survive: float = 0.6
+    penalty_boom: float = 1.0
+    grad_lambda: float = 0.25
+    grad_thr: float = 1.5
+    keepk_safe_delta: int = -1
+    keepk_risky_delta: int = 2
+    rho_safe_delta: float = 0.15
+    rho_risky_delta: float = -0.25
+
+class HazardBanditController:
+    def __init__(self, L: int, cfg: HazardBanditCfg, seed: int = 0):
+        self.cfg = cfg
+        self.L = L
+        self.rng = np.random.default_rng(seed)
+        self.fitness = np.zeros((L, 2), dtype=np.float32)
+        self.choice = np.zeros((L,), dtype=np.int32)
+
+    def select(self) -> np.ndarray:
+        if not self.cfg.enable:
+            self.choice.fill(0)
+            return self.choice.copy()
+        acts = np.zeros((self.L,), dtype=np.int32)
+        for l in range(self.L):
+            explore = (self.cfg.epsilon > 0.0) and (self.rng.random() < self.cfg.epsilon)
+            if explore:
+                a = int(self.rng.integers(0, 2))
+            else:
+                a = int(np.argmax(self.fitness[l]))
+            acts[l] = a
+        self.choice = acts
+        return acts.copy()
+
+    def update(self, reward: float, grad_spike: float, survived: np.ndarray):
+        if not self.cfg.enable:
+            return
+        sv = survived.astype(np.float32)
+        for l, act in enumerate(self.choice.tolist()):
+            base = float(reward * self.cfg.reward_scale)
+            if act == 1:
+                base += self.cfg.bonus_survive * float(sv[l]) - self.cfg.penalty_boom * float(1.0 - sv[l])
+            base -= self.cfg.grad_lambda * float(max(0.0, grad_spike))
+            self.fitness[l, act] = self.cfg.reward_ema * self.fitness[l, act] + (1.0 - self.cfg.reward_ema) * base
+
 # ------------------------------
 # Trainer
 # ------------------------------
@@ -1648,6 +1775,7 @@ class TrainCfg:
     backprop_T: bool = True; T_grad_scale: float = 0.2
     # logits are tiny by design; multiply for numerically healthy softmax
     logit_gain: float = -1.0  # <=0 enables auto gain based on logit std
+    hazard_bandit: HazardBanditCfg = field(default_factory=HazardBanditCfg)
 
 class SpiralV9:
     def __init__(self, V: int = 128, d: int = 96, H: int = 4, L: int = 4, r: int = 64,
@@ -1758,16 +1886,49 @@ class SpiralV9:
                  rng_seed: Optional[int] = None,
                  use_memory: bool = True,
                  mem_scale: Optional[float] = None,
+                 self_dialog: bool = False,
+                 self_dialog_top: int = 8,
+                 self_dialog_alpha: float = 1.5,
+                 self_dialog_margin: float = 0.08,
+                 self_dialog_entropy: float = 0.85,
                  trace_memory: bool = False,
                  trace_neighbors: int = 3,
                  trace_tokens: int = 5,
-                 trace_only_when_used: bool = False) -> np.ndarray:
+                 trace_only_when_used: bool = False,
+                 trace_memory_heatmap: bool = False,
+                 heatmap_top_tokens: int = 32,
+                 heatmap_max_steps: int = 200) -> np.ndarray:
         rng = np.random.default_rng(rng_seed)
         tokens = prompt_ids.astype(np.int64).reshape(1, -1)
         eos_id = getattr(self.tokenizer, "eos_id", 3)
+        heatmap = MemoryHeatmapTracer(top_tokens=heatmap_top_tokens, max_steps=heatmap_max_steps,
+                                      tokenizer=self.tokenizer) if trace_memory_heatmap else None
 
         for tgen in range(max_new_tokens):
             logits, aux = self.student.forward(tokens, logit_gain=self.logit_gain)  # logits: [1,V]
+
+            # ---- student → teacher "self-dialog" guidance when uncertain ----
+            teacher_hint = None
+            hint_alpha = 0.0
+            if self_dialog and hasattr(self, "teacher"):
+                p_student = softmax_rows((logits / max(temperature, 1e-4)).astype(np.float32))[0]
+                ps_sorted = np.sort(p_student)[::-1]
+                margin = float(ps_sorted[0] - ps_sorted[1]) if ps_sorted.size > 1 else 1.0
+                ent = float(-np.sum(p_student * np.log(np.maximum(p_student, 1e-12))) / np.log(max(2, self.V)))
+                uncertainty = max(float(self_dialog_margin - margin), 0.0) / max(self_dialog_margin, 1e-6)
+                uncertainty = max(uncertainty, float(ent >= self_dialog_entropy) * (ent - self_dialog_entropy) / max(1e-6, 1.0 - self_dialog_entropy))
+                if uncertainty > 0.0:
+                    t_logits, Ts_hint, _, _ = self.teacher.forward_batch(tokens, targets=None, update_memory=False,
+                                                                         logit_gain=self.logit_gain)
+                    Tt = float(Ts_hint[0, 0]) if Ts_hint.shape[0] > 0 else 1.0
+                    p_teacher = softmax_rows((t_logits / max(Tt, 1e-6)).astype(np.float32))[0]
+                    topM = min(int(max(1, self_dialog_top)), self.V)
+                    idx_hint = np.argpartition(p_teacher, -topM)[-topM:]
+                    idx_hint = idx_hint[np.argsort(p_teacher[idx_hint])[::-1]]
+                    hint_alpha = float(self_dialog_alpha * np.clip(uncertainty, 0.0, 1.0))
+                    logits[0, idx_hint] += hint_alpha * p_teacher[idx_hint]
+                    teacher_hint = dict(idx=idx_hint, probs=p_teacher[idx_hint], T=Tt, margin=margin, entropy=ent,
+                                        uncertainty=uncertainty, alpha=hint_alpha)
 
             # ---- memory boost in logit-space (student_mem) ----
             inds_m = None
@@ -1801,6 +1962,19 @@ class SpiralV9:
 
             chosen_idx = int(rng.choice(keep, p=keep_p))
 
+            delta_map: Dict[int, float] = {}
+            if logits_before_mem is not None:
+                mem_delta_vec = logits[0] - logits_before_mem[0]
+                order = np.argsort(np.abs(mem_delta_vec))[::-1]
+                top_mem = int(min(heatmap_top_tokens, mem_delta_vec.shape[0]))
+                for j in order[:top_mem]:
+                    dlt = float(mem_delta_vec[j])
+                    if abs(dlt) <= 0.0:
+                        continue
+                    delta_map[int(j)] = dlt
+            if heatmap is not None and heatmap.enabled:
+                heatmap.update(delta_map, chosen=chosen_idx)
+
             # ---- Memory Trace (print AFTER we know chosen) ----
             if trace_memory:
                 mem_used = bool(info_m.get("used", False)) and inds_m is not None and vals_m is not None and inds_m.size > 0
@@ -1809,10 +1983,14 @@ class SpiralV9:
                     print("\n" + "-" * 92)
                     print(f"[MEMTRACE gen_step {tgen+1:03d}] ctx_last={ctx_last} tok={_tok_str(self.tokenizer, ctx_last)}")
                     print(f"mem_used={mem_used}  student_mem_size={int(self.student_mem.size)}  max_sim={float(info_m.get('max_sim', 0.0)):.3f}  scale={float(info_m.get('scale', 0.0)):.3f}")
+                    if teacher_hint is not None:
+                        print(f"teacher_hint alpha={teacher_hint['alpha']:.3f} margin={teacher_hint['margin']:.4f} entropy={teacher_hint['entropy']:.4f} T={teacher_hint['T']:.3f}")
 
                     if not mem_used:
                         print("  (no memory retrieval fired)")
                     else:
+                        p_before = softmax_rows((logits_before_mem / max(temperature, 1e-4)).astype(np.float32))[0]
+                        p_after = softmax_rows((logits / max(temperature, 1e-4)).astype(np.float32))[0]
                         # aggregated boosts (top by Δlogit)
                         order = np.argsort(vals_m)[::-1]
                         print("\n  Aggregated boosts (top Δlogit):")
@@ -1864,7 +2042,10 @@ class SpiralV9:
                         hit = np.where(inds_m == chosen_idx)[0]
                         if hit.size > 0:
                             mem_delta = float(vals_m[int(hit[0])])
-                    print(f"\n  CHOSEN: tid={chosen_idx:4d} p={float(p[chosen_idx]):.4f} memΔ={mem_delta:+.4f} tok={_tok_str(self.tokenizer, chosen_idx)}")
+                    help_delta = 0.0
+                    if mem_used:
+                        help_delta = float(p_after[chosen_idx] - p_before[chosen_idx])
+                    print(f"\n  CHOSEN: tid={chosen_idx:4d} p={float(p[chosen_idx]):.4f} memΔ={mem_delta:+.4f} Δp(mem)={help_delta:+.4f} tok={_tok_str(self.tokenizer, chosen_idx)}")
                     print("-" * 92)
 
             # append token
@@ -1879,16 +2060,30 @@ class SpiralV9:
                       rng_seed: Optional[int] = None,
                       use_memory: bool = True,
                       mem_scale: Optional[float] = None,
+                      self_dialog: bool = False,
+                      self_dialog_top: int = 8,
+                      self_dialog_alpha: float = 1.5,
+                      self_dialog_margin: float = 0.08,
+                      self_dialog_entropy: float = 0.85,
                       trace_memory: bool = False,
                       trace_neighbors: int = 3,
                       trace_tokens: int = 5,
-                      trace_only_when_used: bool = False) -> str:
+                      trace_only_when_used: bool = False,
+                      trace_memory_heatmap: bool = False,
+                      heatmap_top_tokens: int = 32,
+                      heatmap_max_steps: int = 200) -> str:
         ids = tokenizer.encode(prompt, add_special_tokens=True)
         gen = self.generate(ids, max_new_tokens=max_new_tokens,
                             temperature=temperature, top_p=top_p, top_k=top_k, rng_seed=rng_seed,
                             use_memory=use_memory, mem_scale=mem_scale,
+                            self_dialog=self_dialog, self_dialog_top=self_dialog_top,
+                            self_dialog_alpha=self_dialog_alpha, self_dialog_margin=self_dialog_margin,
+                            self_dialog_entropy=self_dialog_entropy,
                             trace_memory=trace_memory, trace_neighbors=trace_neighbors,
-                            trace_tokens=trace_tokens, trace_only_when_used=trace_only_when_used)
+                            trace_tokens=trace_tokens, trace_only_when_used=trace_only_when_used,
+                            trace_memory_heatmap=trace_memory_heatmap,
+                            heatmap_top_tokens=heatmap_top_tokens,
+                            heatmap_max_steps=heatmap_max_steps)
         return tokenizer.decode(gen)
 
     def _train_valid_split(self, tokens: np.ndarray, ctx_len: int, valid_frac: float,
@@ -1964,6 +2159,9 @@ class SpiralV9:
         self.student.set_keepk_layerwise(keepk)
         assert self.student.B.shape == (self.student.cfg.r, self.V), "student B shape mismatch with cfg/V"
 
+        bandit_ctrl = HazardBanditController(self.student.cfg.L, cfg.hazard_bandit, seed=self.seed + 4242)
+        bandit_actions = bandit_ctrl.select()
+        last_ce = None
         for step in range(cfg.steps):
             Bn = cfg.batch
             gain = float(self.logit_gain)
@@ -2067,12 +2265,21 @@ class SpiralV9:
                 g = float(grad_layers[idx])
                 hazard_grad[l_t] = float(np.clip(g / (2.0 * gref), 0.0, 1.0))
             keepk_new = self.student._keepk.copy()
+            bandit_actions = bandit_ctrl.select()
             for l in range(self.student.cfg.L):
                 l_t = min(l, self.teacher.L - 1)
                 hg = hazard_grad[l_t]
                 kmin, kmax = 2, self.student.cfg.k
                 k_target = int(round(kmin + hg * (kmax - kmin)))
                 keepk_new[l] = int(np.clip(round(0.9 * keepk_new[l] + 0.1 * k_target), kmin, kmax))
+                if cfg.hazard_bandit.enable:
+                    act = int(bandit_actions[l])
+                    if act == 0:
+                        keepk_new[l] = int(np.clip(keepk_new[l] + cfg.hazard_bandit.keepk_safe_delta, kmin, kmax))
+                        self.student.u.rho[l] += cfg.hazard_bandit.rho_safe_delta
+                    else:
+                        keepk_new[l] = int(np.clip(keepk_new[l] + cfg.hazard_bandit.keepk_risky_delta, kmin, kmax))
+                        self.student.u.rho[l] += cfg.hazard_bandit.rho_risky_delta
                 # optional periodic jitter to avoid sticking
                 if cfg.keepk_jitter_every > 0 and ((step + 1) % cfg.keepk_jitter_every == 0):
                     jitter = int(np.clip(cfg.keepk_jitter_mag, 1, self.student.cfg.k))
@@ -2108,6 +2315,13 @@ class SpiralV9:
                 dbg_oracle = float(-np.log(np.maximum(self.P[ctx[:, -1], y], 1e-12)).mean())
                 dbg_acc = float((np.argmax(p1, axis=1) == y).mean())
                 print(f"[dbg step {step+1}] nll@T1={dbg_nll:.4f} oracle={dbg_oracle:.4f} uniform={dbg_uniform:.4f} acc@T1={dbg_acc:.3f} gain={self.logit_gain:.1f}")
+            # hazard bandit reward (ΔCE - grad spike penalty)
+            bandit_reward = 0.0 if last_ce is None else float(last_ce - ce)
+            g_norm_rel = float(g_rms / max(1e-6, self.student.cfg.grad_target))
+            grad_spike = max(0.0, g_norm_rel - cfg.hazard_bandit.grad_thr)
+            survived = np.ones((self.student.cfg.L,), dtype=np.float32) * float(grad_spike <= 0.0)
+            bandit_ctrl.update(bandit_reward, grad_spike, survived)
+            last_ce = ce
             log_entry = dict(step=step+1, CE=float(ce), KL=float(kl),
                              ECE=float(ece), brier=float(brier),
                              T=float(T_S.mean()), var=float(meanVars.mean()),
@@ -2117,6 +2331,8 @@ class SpiralV9:
                              hazard=float(hazard_grad.mean()),
                              hazard_teach=float(hazard_teach.mean()), hazard_teach_all=hazard_teach.tolist(),
                              hazard_grad=float(hazard_grad.mean()), hazard_grad_all=hazard_grad.tolist(),
+                             bandit_choice=bandit_actions.tolist(),
+                             bandit_reward=float(bandit_reward), bandit_grad_spike=float(grad_spike),
                              mem_size=float(meta.get("mem_size", 0)),
                              mem_used_frac=float(meta.get("mem_used_frac", 0.0)),
                              mem_mean_maxsim=float(meta.get("mem_mean_maxsim", 0.0)),
@@ -2203,6 +2419,14 @@ def demo(args=None):
     p.add_argument("--mem_trace_tokens", type=int, default=5, help="how many tokens to show per neighbor/aggregate")
     p.add_argument("--mem_trace_only_used", action="store_true", help="print trace only when memory retrieval fires")
     p.add_argument("--mem_scale", type=float, default=None, help="override memory logit scale during generation")
+    p.add_argument("--mem_heatmap", action="store_true", help="show real-time heatmap of memory Δlogits during generation")
+    p.add_argument("--mem_heatmap_top", type=int, default=32, help="track top-N memory-boosted tokens in the heatmap")
+    p.add_argument("--mem_heatmap_steps", type=int, default=200, help="heatmap rolling window size (steps)")
+    p.add_argument("--self_dialog", action="store_true", help="student queries teacher when uncertain and biases logits")
+    p.add_argument("--self_dialog_top", type=int, default=8, help="top-M teacher tokens to use for self-dialog biasing")
+    p.add_argument("--self_dialog_alpha", type=float, default=1.5, help="scale for injecting teacher probs during self-dialog")
+    p.add_argument("--self_dialog_margin", type=float, default=0.08, help="uncertainty margin trigger (p1-p2 below this fires)")
+    p.add_argument("--self_dialog_entropy", type=float, default=0.85, help="normalized entropy trigger for self-dialog")
     p.add_argument("--log_path", type=str, default=None, help="optional JSON path to save training logs")
     p.add_argument("--max_eval_windows", type=int, default=20000, help="cap evaluation windows to avoid OOM")
     p.add_argument("--distil_warmup", type=int, default=20, help="warmup steps before enabling KL distillation")
@@ -2217,6 +2441,15 @@ def demo(args=None):
     p.add_argument("--rag_m", type=int, default=8, help="top-m RAG sources to fuse from n-gram prior")
     p.add_argument("--rag_w", type=float, default=1.5, help="logit boost weight for n-gram RAG suggestions")
     p.add_argument("--override_rag", action="store_true", help="override loaded teacher rag_m/rag_w with CLI values")
+    p.add_argument("--hazard_bandit", action="store_true", help="enable hazard two-armed bandit for keep_k/lr")
+    p.add_argument("--bandit_keepk_risky", type=int, default=2, help="extra keep_k when bandit picks risky mode")
+    p.add_argument("--bandit_keepk_safe", type=int, default=-1, help="keep_k delta when bandit picks safe mode")
+    p.add_argument("--bandit_rho_risky", type=float, default=-0.25, help="rho delta (lr up if negative) for risky mode")
+    p.add_argument("--bandit_rho_safe", type=float, default=0.15, help="rho delta for safe mode")
+    p.add_argument("--bandit_bonus", type=float, default=0.6, help="survival bonus when risky mode does not spike")
+    p.add_argument("--bandit_penalty", type=float, default=1.0, help="penalty when risky mode spikes")
+    p.add_argument("--bandit_grad_thr", type=float, default=1.5, help="relative grad threshold before counting a spike")
+    p.add_argument("--bandit_reward_scale", type=float, default=1.0, help="scale ΔCE reward before feeding bandit")
     parsed = p.parse_args(args=args)
 
     data_tokens = None
@@ -2271,6 +2504,15 @@ def demo(args=None):
 
     logs: List[Dict[str, float]] = []
     if parsed.steps > 0:
+        bandit_cfg = HazardBanditCfg(enable=parsed.hazard_bandit,
+                                     keepk_risky_delta=parsed.bandit_keepk_risky,
+                                     keepk_safe_delta=parsed.bandit_keepk_safe,
+                                     rho_risky_delta=parsed.bandit_rho_risky,
+                                     rho_safe_delta=parsed.bandit_rho_safe,
+                                     bonus_survive=parsed.bandit_bonus,
+                                     penalty_boom=parsed.bandit_penalty,
+                                     grad_thr=parsed.bandit_grad_thr,
+                                     reward_scale=parsed.bandit_reward_scale)
         cfg = TrainCfg(steps=parsed.steps, batch=parsed.batch, ctx_len=parsed.ctx_len,
                        valid_frac=parsed.valid_frac, eval_every=parsed.eval_every, max_eval_windows=parsed.max_eval_windows,
                        T0=1.0, lam=1.0, gamma=1.0, Tmin=0.7, Tmax=1.8, topk=48,
@@ -2280,7 +2522,8 @@ def demo(args=None):
                        trace_every=parsed.trace_every, trace_k=parsed.trace_k,
                        lr_k_stab=0.02, lr_k_expl=0.01,
                        keepk_boost=1, rho_boost=0.0, backprop_T=True, T_grad_scale=0.1,
-                       data_path=parsed.data_path, logit_gain=parsed.logit_gain)
+                       data_path=parsed.data_path, logit_gain=parsed.logit_gain,
+                       hazard_bandit=bandit_cfg)
         logs = eng.train(cfg, data_tokens=data_tokens)
         if logs and parsed.log_path:
             with open(parsed.log_path, "w", encoding="utf-8") as f:
@@ -2304,10 +2547,17 @@ def demo(args=None):
                                      temperature=parsed.temperature, top_p=parsed.top_p, top_k=parsed.top_k,
                                      rng_seed=rng_seed,
                                      use_memory=True, mem_scale=parsed.mem_scale,
+                                     self_dialog=parsed.self_dialog, self_dialog_top=parsed.self_dialog_top,
+                                     self_dialog_alpha=parsed.self_dialog_alpha,
+                                     self_dialog_margin=parsed.self_dialog_margin,
+                                     self_dialog_entropy=parsed.self_dialog_entropy,
                                      trace_memory=parsed.mem_trace,
                                      trace_neighbors=parsed.mem_trace_neighbors,
                                      trace_tokens=parsed.mem_trace_tokens,
-                                     trace_only_when_used=parsed.mem_trace_only_used)
+                                     trace_only_when_used=parsed.mem_trace_only_used,
+                                     trace_memory_heatmap=parsed.mem_heatmap,
+                                     heatmap_top_tokens=parsed.mem_heatmap_top,
+                                     heatmap_max_steps=parsed.mem_heatmap_steps)
             print(">> generated text:", text)
         else:
             try:
@@ -2318,10 +2568,17 @@ def demo(args=None):
             gen = eng.generate(ids, max_new_tokens=parsed.max_new_tokens,
                                temperature=parsed.temperature, top_p=parsed.top_p, top_k=parsed.top_k, rng_seed=rng_seed,
                                use_memory=True, mem_scale=parsed.mem_scale,
+                               self_dialog=parsed.self_dialog, self_dialog_top=parsed.self_dialog_top,
+                               self_dialog_alpha=parsed.self_dialog_alpha,
+                               self_dialog_margin=parsed.self_dialog_margin,
+                               self_dialog_entropy=parsed.self_dialog_entropy,
                                trace_memory=parsed.mem_trace,
                                trace_neighbors=parsed.mem_trace_neighbors,
                                trace_tokens=parsed.mem_trace_tokens,
-                               trace_only_when_used=parsed.mem_trace_only_used)
+                               trace_only_when_used=parsed.mem_trace_only_used,
+                               trace_memory_heatmap=parsed.mem_heatmap,
+                               heatmap_top_tokens=parsed.mem_heatmap_top,
+                               heatmap_max_steps=parsed.mem_heatmap_steps)
             print(">> generated token ids:", gen.tolist())
 
     print("== SpiralFullFusion V9 (compact) Demo — DONE ==")
