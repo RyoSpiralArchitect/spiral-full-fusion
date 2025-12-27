@@ -38,16 +38,19 @@ def safe_matmul(a: np.ndarray, b: np.ndarray) -> np.ndarray:
 # ------------------------------
 @dataclass
 class TokenizerCfg:
-    vocab_size: int = 512      # desired vocabulary size (will be clamped to >= 260)
-    min_freq: int = 2          # minimum pair frequency to merge
+    vocab_size: int = 1024      # desired vocabulary size (will be clamped to >= 260)
+    min_freq: int = 2           # minimum pair frequency to merge
     add_bos: bool = True
     add_eos: bool = True
     lowercase: bool = False
+    motif_topk: int = 48        # register top-N recurring multi-byte motifs as atomic tokens
+    motif_min_len: int = 3
+    motif_max_len: int = 8
 
 
 class SpiralTokenizer:
     """
-    Compact byte-level tokenizer with BPE-style merges.
+    Compact byte-level tokenizer with BPE-style merges + motif-aware atoms.
     No external dependencies; suitable for quick CLI demos when only a text path is available.
     """
 
@@ -62,6 +65,8 @@ class SpiralTokenizer:
         self.id_to_bytes: List[Optional[bytes]] = []
         self.merge_ranks: Dict[Tuple[int, int], int] = {}  # pair -> rank (lower is earlier/better)
         self.merge_to_id: Dict[Tuple[int, int], int] = {}  # pair -> new token id
+        self.motif_to_id: Dict[bytes, int] = {}
+        self.motif_lengths: List[int] = []
         self._init_base_vocab()
 
     # ------------------ training helpers ------------------
@@ -116,14 +121,66 @@ class SpiralTokenizer:
         printable = ''.join(chr(c) if 32 <= c < 127 else '.' for c in piece)
         return f"<{len(piece)}:{printable}>"
 
+    def _register_motifs(self, motifs: List[bytes]):
+        # Register motifs as atomic tokens before merges to bias toward recurring structures.
+        if not motifs:
+            return
+        for mot in motifs:
+            name = f"<motif:{self._format_piece(mot)}>"
+            if name in self.token_to_id:
+                continue
+            self._register_token(name, mot)
+            self.motif_to_id[mot] = self.token_to_id[name]
+        self.motif_lengths = sorted({len(m) for m in self.motif_to_id.keys()}, reverse=True)
+
+    def _find_top_motifs(self, lines: List[bytes]) -> List[bytes]:
+        counts: Dict[bytes, int] = {}
+        min_len = max(1, self.cfg.motif_min_len)
+        max_len = max(min_len, self.cfg.motif_max_len)
+        for raw in lines:
+            n = len(raw)
+            for i in range(n):
+                for L in range(min_len, min(max_len, n - i) + 1):
+                    mot = raw[i:i+L]
+                    counts[mot] = counts.get(mot, 0) + 1
+        # filter using min_freq to align with BPE merge threshold
+        filtered = [(mot, c) for mot, c in counts.items() if c >= self.cfg.min_freq]
+        filtered.sort(key=lambda mc: (mc[1], len(mc[0])), reverse=True)
+        top = [mot for mot, _ in filtered[: self.cfg.motif_topk]]
+        return top
+
+    def _tokenize_bytes_with_motifs(self, raw_bytes: bytes) -> List[int]:
+        ids: List[int] = []
+        i = 0; n = len(raw_bytes)
+        while i < n:
+            matched = False
+            for L in self.motif_lengths:
+                if i + L > n:
+                    continue
+                chunk = raw_bytes[i:i+L]
+                tid = self.motif_to_id.get(chunk)
+                if tid is not None:
+                    ids.append(tid)
+                    i += L
+                    matched = True
+                    break
+            if matched:
+                continue
+            ids.append(self.byte_offset + raw_bytes[i])
+            i += 1
+        return ids
+
     def train_from_text(self, text: str):
         if self.cfg.lowercase:
             text = text.lower()
+        # pre-tokenize raw bytes per line
+        raw_lines = [line.encode("utf-8") for line in text.splitlines()]
+        motifs = self._find_top_motifs(raw_lines)
+        self._register_motifs(motifs)
         # initialize corpus as byte tokens per line to retain some locality
         sequences: List[List[int]] = []
-        for line in text.splitlines():
-            raw_bytes = line.encode("utf-8")
-            seq = [self.byte_offset + b for b in raw_bytes]
+        for raw_bytes in raw_lines:
+            seq = self._tokenize_bytes_with_motifs(raw_bytes)
             if self.cfg.add_bos: seq = [self.bos_id] + seq
             if self.cfg.add_eos: seq = seq + [self.eos_id]
             if len(seq) > 0:
@@ -169,8 +226,7 @@ class SpiralTokenizer:
     def encode(self, text: str, add_special_tokens: bool = True) -> np.ndarray:
         if self.cfg.lowercase:
             text = text.lower()
-        byte_ids = [self.byte_offset + b for b in text.encode("utf-8")]
-        ids = byte_ids
+        ids = self._tokenize_bytes_with_motifs(text.encode("utf-8"))
         ids = self._bpe(ids)
         if add_special_tokens and self.cfg.add_bos:
             ids = [self.bos_id] + ids
@@ -603,7 +659,7 @@ class UncertaintyLR:
 
 @dataclass
 class StudentCfg:
-    L: int = 4; d: int = 64; k: int = 16; V: int = 64; r: int = 16
+    L: int = 4; d: int = 96; k: int = 24; V: int = 128; r: int = 24
     base_lr: float = 5e-2; head_lr: float = 5e-2; emb_lr: float = 5e-2
     grad_target: float = 0.1
     seed: int = 123
@@ -763,11 +819,12 @@ class TrainCfg:
     backprop_T: bool = True; T_grad_scale: float = 0.1
 
 class SpiralV9:
-    def __init__(self, V: int = 64, d: int = 64, H: int = 3, L: int = 3, r: int = 16, seed: int = 0):
+    def __init__(self, V: int = 128, d: int = 96, H: int = 4, L: int = 4, r: int = 24, seed: int = 0):
         self.V, self.d, self.H, self.L, self.r = V, d, H, L, r
         self.P = make_bigram(V, seed=7)
         self.teacher = SpiralTeacher(V, d, H, L, r, self.P, TeacherCfg(), seed=42)
-        self.student = StudentV9(StudentCfg(L=4, d=d, k=16, V=V, r=r, seed=123), self.teacher.B)
+        student_cfg = StudentCfg(L=max(4, L), d=d, k=max(16, d // 4), V=V, r=r, seed=123)
+        self.student = StudentV9(student_cfg, self.teacher.B)
 
     def train(self, cfg: TrainCfg, data_tokens: Optional[np.ndarray] = None) -> List[Dict[str, float]]:
         rng = np.random.default_rng(0)
@@ -871,14 +928,14 @@ def demo(args=None):
     p.add_argument("--steps", type=int, default=500)
     p.add_argument("--batch", type=int, default=16)
     p.add_argument("--ctx_len", type=int, default=8)
-    p.add_argument("--V", type=int, default=64)
-    p.add_argument("--d", type=int, default=64)
-    p.add_argument("--H", type=int, default=3)
-    p.add_argument("--L", type=int, default=3)
-    p.add_argument("--r", type=int, default=16)
+    p.add_argument("--V", type=int, default=128)
+    p.add_argument("--d", type=int, default=96)
+    p.add_argument("--H", type=int, default=4)
+    p.add_argument("--L", type=int, default=4)
+    p.add_argument("--r", type=int, default=24)
     p.add_argument("--data_path", type=str, default=None, help="optional npy file with token ids")
     p.add_argument("--text_path", type=str, default=None, help="optional utf-8 text file to train tokenizer + dataset")
-    p.add_argument("--tok_vocab", type=int, default=512, help="tokenizer vocab size target when using text_path")
+    p.add_argument("--tok_vocab", type=int, default=1024, help="tokenizer vocab size target when using text_path")
     p.add_argument("--tok_min_freq", type=int, default=2, help="minimum pair frequency for BPE merges")
     p.add_argument("--tok_lowercase", action="store_true", help="lowercase text before tokenization")
     p.add_argument("--tok_no_bos", action="store_true", help="disable adding BOS during tokenization")
@@ -904,7 +961,7 @@ def demo(args=None):
 
     eng = SpiralV9(V=vocab_override, d=parsed.d, H=parsed.H, L=parsed.L, r=parsed.r, seed=0)
     cfg = TrainCfg(steps=parsed.steps, batch=parsed.batch, ctx_len=parsed.ctx_len,
-                   T0=1.0, lam=1.0, gamma=1.0, Tmin=0.7, Tmax=1.8, topk=32,
+                   T0=1.0, lam=1.0, gamma=1.0, Tmin=0.7, Tmax=1.8, topk=48,
                    lam_distil=0.1, lr_k_stab=0.02, lr_k_expl=0.01,
                    keepk_boost=2, rho_boost=0.0, backprop_T=True, T_grad_scale=0.1,
                    data_path=parsed.data_path)
