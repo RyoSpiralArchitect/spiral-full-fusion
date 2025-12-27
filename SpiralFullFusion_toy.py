@@ -180,21 +180,24 @@ class SpiralTokenizer:
     def _tokenize_bytes_with_motifs(self, raw_bytes: bytes) -> List[int]:
         ids: List[int] = []
         i = 0; n = len(raw_bytes)
+        # precompute word spans to avoid substring matches; bytes regex keeps offsets aligned
+        word_spans = list(re.finditer(rb"[A-Za-z0-9_']+", raw_bytes))
+        w_ptr = 0
         while i < n:
+            while w_ptr < len(word_spans) and word_spans[w_ptr].end() <= i:
+                w_ptr += 1
+            # whole-word atom only if the pointer is exactly at the word start
+            if w_ptr < len(word_spans):
+                s, e = word_spans[w_ptr].span()
+                if i == s:
+                    chunk = raw_bytes[s:e]
+                    tid = self.word_to_id.get(chunk)
+                    if tid is not None:
+                        ids.append(tid)
+                        i = e
+                        continue
             matched = False
             # prefer whole-word atoms, then motifs, else fallback bytes
-            for L in self.word_lengths:
-                if i + L > n:
-                    continue
-                chunk = raw_bytes[i:i+L]
-                tid = self.word_to_id.get(chunk)
-                if tid is not None:
-                    ids.append(tid)
-                    i += L
-                    matched = True
-                    break
-            if matched:
-                continue
             for L in self.motif_lengths:
                 if i + L > n:
                     continue
@@ -412,6 +415,28 @@ def trigram_from_tokens(tokens: np.ndarray, V: int, bos_id: int = 2, eos_id: int
     for key, cnt in counts.items():
         trigram_probs[key] = cnt / np.maximum(cnt.sum(), EPS)
     return trigram_probs
+
+
+def pack_trigram(tri: Optional[Dict[Tuple[int, int], np.ndarray]], V: int) -> Optional[Dict[str, np.ndarray]]:
+    if tri is None:
+        return None
+    if len(tri) == 0:
+        return dict(keys=np.zeros((0, 2), dtype=np.int64), vals=np.zeros((0, V), dtype=np.float32))
+    keys = np.array(list(tri.keys()), dtype=np.int64)
+    vals = np.stack([tri[tuple(k)] for k in keys], axis=0).astype(np.float32)
+    return dict(keys=keys, vals=vals)
+
+
+def unpack_trigram(packed: Optional[Dict[str, np.ndarray]]) -> Optional[Dict[Tuple[int, int], np.ndarray]]:
+    if packed is None:
+        return None
+    keys = packed.get("keys", None)
+    vals = packed.get("vals", None)
+    if keys is None or vals is None:
+        return None
+    if keys.shape[0] == 0:
+        return {}
+    return {(int(a), int(b)): vals[i].astype(np.float32) for i, (a, b) in enumerate(keys)}
 
 def _line_spans_from_bos_eos(data: np.ndarray, ctx_len: int, bos_id: int = 2, eos_id: int = 3) -> List[Tuple[int, int]]:
     # Extract contiguous spans [bos_idx, eos_idx] that are long enough for a ctx_len+1 window.
@@ -757,7 +782,7 @@ class SpiralTeacher:
     def state_dict(self) -> Dict[str, Any]:
         return dict(
             P=self.P.copy(),
-            trigram_map={k: v.copy() for k, v in self.trigram_map.items()} if self.trigram_map is not None else None,
+            trigram_map=pack_trigram(self.trigram_map, self.V),
             lm=self.lm.state_dict(),
             fusers=[f.state_dict() for f in self.fusers],
             rel=self.rel.state_dict(),
@@ -768,10 +793,11 @@ class SpiralTeacher:
     def load_state(self, state: Dict[str, Any]):
         self.P = state["P"].astype(np.float32)
         trig = state.get("trigram_map", None)
-        if trig is not None:
-            self.trigram_map = {tuple(k): np.array(v, dtype=np.float32) for k, v in trig.items()}
-        else:
-            self.trigram_map = None
+        trig_map = unpack_trigram(trig) if isinstance(trig, dict) else None
+        if trig_map is None and trig is not None and isinstance(trig, dict):
+            # legacy tuple-keyed dict fallback
+            trig_map = {tuple(k): np.array(v, dtype=np.float32) for k, v in trig.items()}
+        self.trigram_map = trig_map
         self.cfg = TeacherCfg(**state.get("cfg", asdict(self.cfg)))
         self.lm.load_state(state["lm"])
         for f, saved in zip(self.fusers, state["fusers"]):
@@ -1460,6 +1486,7 @@ def demo(args=None):
     p.add_argument("--kl_weight", type=float, default=1.0, help="scaling for KL distillation term")
     p.add_argument("--rag_m", type=int, default=8, help="top-m RAG sources to fuse from n-gram prior")
     p.add_argument("--rag_w", type=float, default=1.5, help="logit boost weight for n-gram RAG suggestions")
+    p.add_argument("--override_rag", action="store_true", help="override loaded teacher rag_m/rag_w with CLI values")
     parsed = p.parse_args(args=args)
 
     data_tokens = None
@@ -1496,6 +1523,10 @@ def demo(args=None):
     else:
         eng = SpiralV9(V=vocab_override, d=parsed.d, H=parsed.H, L=parsed.L, r=parsed.r,
                        seed=parsed.seed, teacher_cfg=teacher_cfg)
+
+    if parsed.override_rag:
+        eng.teacher.cfg.rag_m = parsed.rag_m
+        eng.teacher.cfg.rag_w = parsed.rag_w
 
     if tokenizer is not None and eng.tokenizer is None:
         eng.set_tokenizer(tokenizer)
