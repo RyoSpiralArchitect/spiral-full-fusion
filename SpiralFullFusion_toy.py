@@ -360,8 +360,15 @@ class SpiralTokenizer:
         np.savez_compressed(path, tokenizer_state=np.array([self.state_dict()], dtype=object))
 
     @classmethod
-    def load(cls, path: str) -> "SpiralTokenizer":
-        data = np.load(path, allow_pickle=True)
+    def load(cls, path: str, allow_pickle: bool = False) -> "SpiralTokenizer":
+        try:
+            data = np.load(path, allow_pickle=False)
+        except ValueError as e:
+            if not allow_pickle:
+                raise ValueError(
+                    "Tokenizer archive contains pickled objects; rerun with allow_pickle=True (or CLI --allow_pickle_load) only for trusted files."
+                ) from e
+            data = np.load(path, allow_pickle=True)
         state = data["tokenizer_state"][0].item()
         return cls.from_state(state)
 
@@ -1926,8 +1933,15 @@ class SpiralV9:
         np.savez_compressed(path, **{k: np.array([v], dtype=object) for k, v in state.items()})
 
     @classmethod
-    def load(cls, path: str) -> "SpiralV9":
-        data = np.load(path, allow_pickle=True)
+    def load(cls, path: str, allow_pickle: bool = False) -> "SpiralV9":
+        try:
+            data = np.load(path, allow_pickle=False)
+        except ValueError as e:
+            if not allow_pickle:
+                raise ValueError(
+                    "Model archive contains pickled objects; rerun with allow_pickle=True (or CLI --allow_pickle_load) only when the file is trusted."
+                ) from e
+            data = np.load(path, allow_pickle=True)
         student_raw = data["student_state"]
         student_state = student_raw[0] if isinstance(student_raw, np.ndarray) else student_raw
         if hasattr(student_state, "item") and not isinstance(student_state, dict):
@@ -2522,6 +2536,8 @@ def demo(args=None):
     p.add_argument("--tok_no_eos", action="store_true", help="disable adding EOS during tokenization")
     p.add_argument("--save_path", type=str, default=None, help="npz path to save trained student/ tokenizer")
     p.add_argument("--load_path", type=str, default=None, help="npz path to load a trained model")
+    p.add_argument("--allow_pickle_load", action="store_true",
+                   help="allow loading pickled archives (only use with trusted model/tokenizer files)")
     p.add_argument("--prompt", type=str, default=None, help="text or comma-separated token ids for inference")
     p.add_argument("--max_new_tokens", type=int, default=32, help="number of new tokens to generate during inference")
     p.add_argument("--temperature", type=float, default=1.0, help="sampling temperature")
@@ -2571,7 +2587,7 @@ def demo(args=None):
     tokenizer: Optional[SpiralTokenizer] = None
 
     if parsed.data_path:
-        data_tokens = np.load(parsed.data_path).astype(np.int64).reshape(-1)
+        data_tokens = np.load(parsed.data_path, allow_pickle=False).astype(np.int64).reshape(-1)
         data_vmax = int(data_tokens.max()) + 1 if data_tokens.size > 0 else 0
         vocab_override = max(vocab_override, data_vmax)
         data_tokens = np.clip(data_tokens, 0, vocab_override - 1)
@@ -2595,7 +2611,7 @@ def demo(args=None):
     teacher_cfg = TeacherCfg(rag_m=parsed.rag_m, rag_w=parsed.rag_w, logit_gain=parsed.logit_gain)
 
     if parsed.load_path:
-        eng = SpiralV9.load(parsed.load_path)
+        eng = SpiralV9.load(parsed.load_path, allow_pickle=parsed.allow_pickle_load)
         tokenizer = tokenizer or eng.tokenizer
     else:
         eng = SpiralV9(V=vocab_override, d=parsed.d, H=parsed.H, L=parsed.L, r=parsed.r,
