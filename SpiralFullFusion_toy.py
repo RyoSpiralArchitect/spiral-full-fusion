@@ -1250,17 +1250,65 @@ class SiLU:
         x = self._x; s = 1.0 / (1.0 + np.exp(-np.clip(x, -20.0, 20.0)))
         return dy * (s * (1.0 + x * (1.0 - s)))
 
+@dataclass
+class MetaSleepCfg:
+    enable: bool = False
+    k_snap: int = 4
+    ema: float = 0.05
+    pca_rank: int = 4
+    oja_lr: float = 0.01
+    sleep_eta: float = 0.02
+    sleep_rho: float = 0.995
+    shrink_beta: float = 1e-3
+    logit_gamma: float = 1e-3
+    whiten_eps: float = 1e-5
+    delta_proj: float = 1e-3
+
 class RankKAttention:
-    def __init__(self, d: int, k: int, rng):
+    def __init__(self, d: int, k: int, rng, meta_cfg: Optional[MetaSleepCfg] = None):
         self.q = Linear(d, k, rng); self.k = Linear(d, k, rng); self.v = Linear(d, d, rng)
         self.kdim = k; self._cache = None
+        self.meta_cfg = meta_cfg or MetaSleepCfg()
+        r = int(np.clip(self.meta_cfg.pca_rank, 1, self.kdim))
+        self.meta_mu = np.zeros((self.kdim,), dtype=np.float32)
+        self.meta_var = np.ones((self.kdim,), dtype=np.float32)
+        u0 = rng.normal(0, 0.05, size=(self.kdim, r)).astype(np.float32)
+        self.meta_U = u0 / np.maximum(np.linalg.norm(u0, axis=0, keepdims=True), 1e-6)
+        self.meta_M = np.zeros((self.kdim, self.kdim), dtype=np.float32)
+        self._snap_q = []
+        self._snap_y = []
     def forward(self, x: np.ndarray, keep_k: int) -> Tuple[np.ndarray, np.ndarray]:
         keep_k = int(np.clip(keep_k, 1, self.kdim))
         Q = self.q.forward(x); K = self.k.forward(x); V = self.v.forward(x)
         Qm = Q[:, :, :keep_k]; Km = K[:, :, :keep_k]
+
+        # Meta-sleep: awake stats
+        if self.meta_cfg.enable:
+            self._meta_awake(Km)
+            Km = self._meta_shrink(Km)
+
+        # optional logit bias along meta directions
+        S_bias = None
+        if self.meta_cfg.enable and self.meta_cfg.logit_gamma > 0.0:
+            S_bias = self._meta_logit_bias(Qm, Km)
+
         S = safe_matmul(Qm, np.transpose(Km, (0, 2, 1))) / np.sqrt(max(1, keep_k))
+        if S_bias is not None:
+            S += S_bias
         W = softmax_rows(S)
         H = safe_matmul(W, V)
+
+        # Meta memory injection Y <- Y + Q M^T
+        if self.meta_cfg.enable:
+            H[:, :, :self.kdim] += safe_matmul(Q[:, :, :self.kdim], self.meta_M.T)
+            self._snap_q.append(Qm.mean(axis=(0, 1)))
+            self._snap_y.append(H.mean(axis=(0, 1))[:keep_k])
+            if len(self._snap_q) >= self.meta_cfg.k_snap:
+                q_bar = np.stack(self._snap_q, axis=0).mean(axis=0)
+                y_bar = np.stack(self._snap_y, axis=0).mean(axis=0)
+                self._meta_sleep(q_bar, y_bar, keep_k=keep_k)
+                self._snap_q.clear(); self._snap_y.clear()
+
         self._cache = (x, Q, K, V, W, keep_k)
         return H, W
     def backward(self, dH: np.ndarray) -> np.ndarray:
@@ -1278,6 +1326,63 @@ class RankKAttention:
     def step(self, lr: float):
         self.q.step(lr); self.k.step(lr); self.v.step(lr)
 
+    # ----- Meta-sleep helpers -----
+    def _meta_awake(self, K: np.ndarray):
+        # K: [B,T,k]
+        alpha = float(self.meta_cfg.ema)
+        kfull = np.zeros((K.shape[0], K.shape[1], self.kdim), dtype=np.float32)
+        kfull[:, :, :K.shape[2]] = K
+        m = kfull.mean(axis=(0, 1))
+        c = kfull - m
+        v = np.mean(c * c, axis=(0, 1))
+        self.meta_mu = (1 - alpha) * self.meta_mu + alpha * m
+        self.meta_var = (1 - alpha) * self.meta_var + alpha * v
+        # Oja update for principal directions
+        lr = float(self.meta_cfg.oja_lr)
+        for r in range(self.meta_U.shape[1]):
+            u = self.meta_U[:, r]
+            proj = np.tensordot(kfull.reshape(-1, self.kdim), u, axes=1)
+            du = lr * (kfull.reshape(-1, self.kdim).T @ (proj)) / max(1, kfull.size // self.kdim)
+            u = u + du
+            u = u - np.sum(self.meta_U[:, :r] * u[:, None], axis=1)
+            self.meta_U[:, r] = u / max(1e-6, np.linalg.norm(u))
+
+    def _meta_proj(self, keep_k: int) -> np.ndarray:
+        U = self.meta_U[:keep_k]
+        return safe_matmul(U, U.T) + float(self.meta_cfg.delta_proj) * np.eye(keep_k, dtype=np.float32)
+
+    def _meta_whiten(self, keep_k: int) -> np.ndarray:
+        v = np.clip(self.meta_var[:keep_k], self.meta_cfg.whiten_eps, None)
+        return np.diag(1.0 / np.sqrt(v)).astype(np.float32)
+
+    def _meta_sleep(self, q_bar: np.ndarray, y_bar: np.ndarray, keep_k: int):
+        P = self._meta_proj(keep_k)
+        W = self._meta_whiten(keep_k)
+        q_t = safe_matmul(W, safe_matmul(P, q_bar.reshape(-1, 1))).reshape(-1)
+        y_t = safe_matmul(W, safe_matmul(P, y_bar.reshape(-1, 1))).reshape(-1)
+        eta = float(self.meta_cfg.sleep_eta)
+        rho = float(self.meta_cfg.sleep_rho)
+        M = self.meta_M[:keep_k, :keep_k]
+        M = rho * M + eta * np.outer(y_t, q_t)
+        self.meta_M[:keep_k, :keep_k] = M
+
+    def _meta_shrink(self, K: np.ndarray) -> np.ndarray:
+        beta = float(self.meta_cfg.shrink_beta)
+        if beta <= 0.0:
+            return K
+        keep_k = K.shape[-1]
+        P = self._meta_proj(keep_k)
+        return ((1 - beta) * K + beta * safe_matmul(K, P.T)).astype(np.float32)
+
+    def _meta_logit_bias(self, Q: np.ndarray, K: np.ndarray) -> np.ndarray:
+        keep_k = Q.shape[-1]
+        P = self._meta_proj(keep_k)
+        Wm = self._meta_whiten(keep_k)
+        Qw = safe_matmul(Q, safe_matmul(P, Wm))
+        Kw = safe_matmul(K, safe_matmul(P, Wm))
+        gamma = float(self.meta_cfg.logit_gamma)
+        return gamma * safe_matmul(Qw, np.transpose(Kw, (0, 2, 1))) / np.sqrt(max(1, keep_k))
+
 class FFN:
     def __init__(self, d: int, rng):
         self.fc1 = Linear(d, 4 * d, rng); self.act = SiLU(); self.fc2 = Linear(4 * d, d, rng)
@@ -1289,8 +1394,8 @@ class FFN:
         self.fc1.step(lr); self.fc2.step(lr)
 
 class SpiralBlock:
-    def __init__(self, d: int, k: int, rng):
-        self.attn = RankKAttention(d, k, rng); self.ffn = FFN(d, rng)
+    def __init__(self, d: int, k: int, rng, meta_cfg: Optional[MetaSleepCfg] = None):
+        self.attn = RankKAttention(d, k, rng, meta_cfg=meta_cfg); self.ffn = FFN(d, rng)
     def forward(self, x: np.ndarray, keep_k: int) -> Tuple[np.ndarray, np.ndarray]:
         H, W = self.attn.forward(x, keep_k=keep_k); x1 = x + H; y = self.ffn.forward(x1); return x1 + y, W
     def backward(self, dout: np.ndarray) -> np.ndarray:
@@ -1335,13 +1440,14 @@ class StudentCfg:
     base_lr: float = 5e-2; head_lr: float = 5e-2; emb_lr: float = 5e-2
     grad_target: float = 0.1
     seed: int = 123
+    meta_sleep: MetaSleepCfg = field(default_factory=MetaSleepCfg)
 
 class StudentV9:
     def __init__(self, cfg: StudentCfg, shared_B: np.ndarray):
         self.cfg = cfg
         rng = np.random.default_rng(cfg.seed)
         self.embed = Embedding(cfg.V, cfg.d, rng)
-        self.blocks = [SpiralBlock(cfg.d, cfg.k, rng) for _ in range(cfg.L)]
+        self.blocks = [SpiralBlock(cfg.d, cfg.k, rng, meta_cfg=cfg.meta_sleep) for _ in range(cfg.L)]
         self.rank_head = RankParamHead(cfg.d, cfg.r, rng)
         self.B = shared_B.astype(np.float32)  # [r,V]
         self.u = UncertaintyLR(cfg.L, init=0.0)
@@ -1357,7 +1463,10 @@ class StudentV9:
             blocks.append(dict(
                 attn=dict(q=self._linear_state(blk.attn.q),
                           k=self._linear_state(blk.attn.k),
-                          v=self._linear_state(blk.attn.v)),
+                          v=self._linear_state(blk.attn.v),
+                          meta=dict(mu=blk.attn.meta_mu.copy(), var=blk.attn.meta_var.copy(),
+                                    U=blk.attn.meta_U.copy(), M=blk.attn.meta_M.copy())
+                          ),
                 ffn=dict(fc1=self._linear_state(blk.ffn.fc1),
                          fc2=self._linear_state(blk.ffn.fc2)),
             ))
@@ -1383,6 +1492,11 @@ class StudentV9:
                 lin.W = ld["W"].astype(np.float32); lin.b = ld["b"].astype(np.float32)
             blk.ffn.fc1.W = sd["ffn"]["fc1"]["W"].astype(np.float32); blk.ffn.fc1.b = sd["ffn"]["fc1"]["b"].astype(np.float32)
             blk.ffn.fc2.W = sd["ffn"]["fc2"]["W"].astype(np.float32); blk.ffn.fc2.b = sd["ffn"]["fc2"]["b"].astype(np.float32)
+            if "meta" in sd["attn"]:
+                blk.attn.meta_mu = sd["attn"]["meta"]["mu"].astype(np.float32)
+                blk.attn.meta_var = sd["attn"]["meta"]["var"].astype(np.float32)
+                blk.attn.meta_U = sd["attn"]["meta"]["U"].astype(np.float32)
+                blk.attn.meta_M = sd["attn"]["meta"]["M"].astype(np.float32)
         self.rank_head.mean.W = state["rank_head"]["mean"]["W"].astype(np.float32)
         self.rank_head.mean.b = state["rank_head"]["mean"]["b"].astype(np.float32)
         self.rank_head.logtau.W = state["rank_head"]["logtau"]["W"].astype(np.float32)

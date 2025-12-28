@@ -32,6 +32,7 @@ You’ll get a brisk training run that paints the loop: generate → reliability
 - **Heatmap “X-ray” mode**: pair `--mem_trace` with `--mem_heatmap` to stream a rolling matplotlib heatmap of memory-driven Δlogits across the last 200 generation steps (configurable via `--mem_heatmap_top`/`--mem_heatmap_steps`).
 - **Self-dialogue taps the teacher**: when the student is uncertain, `--self_dialog` runs a one-off teacher forward pass and injects its top tokens back into the logits (scaled by uncertainty). Tune with `--self_dialog_margin`, `--self_dialog_entropy`, `--self_dialog_top`, and `--self_dialog_alpha`.
 - **Hazard bandit**: flip `--hazard_bandit` to let a per-layer two-armed bandit pick safe vs. risky modes (keep_k / LR deltas) with survival bonuses and spike penalties. Adjust deltas and thresholds via the `--bandit_*` flags.
+- **Meta-Sleep attention**: the rank-k attention layers now track meta statistics of keys (EMA mean/var + Oja PCA) and can slowly integrate “sleep” memories with whitening and shrinkage. Enable with `StudentCfg.meta_sleep.enable` in code to experiment with delayed consolidation.
 
 ## Usage samples
 Train from scratch and save:
