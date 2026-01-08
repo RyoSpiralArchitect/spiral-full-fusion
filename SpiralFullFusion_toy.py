@@ -7,6 +7,7 @@ from typing import List, Tuple, Optional, Dict, Any
 import glob
 import math
 import numpy as np
+import os
 import re
 import importlib.util
 
@@ -2440,6 +2441,12 @@ class TrainCfg:
     galois_enable: bool = True
     galois_every: int = 1
     hazard_bandit: HazardBanditCfg = field(default_factory=HazardBanditCfg)
+    # checkpointing
+    start_step: int = 0
+    rng_state: Optional[Dict[str, Any]] = None
+    ckpt_dir: Optional[str] = None
+    save_every: int = 0
+    keep_last: int = 3
 
 class SpiralV9:
     def __init__(self, V: int = 128, d: int = 96, H: int = 4, L: int = 4, r: int = 64,
@@ -2481,6 +2488,87 @@ class SpiralV9:
         if self.tokenizer is not None:
             state["tokenizer_state"] = self.tokenizer.state_dict()
         np.savez_compressed(path, **{k: np.array([v], dtype=object) for k, v in state.items()})
+
+def save_checkpoint(ckpt_path: str, eng: SpiralV9, step: int, np_rng_state: Optional[Dict[str, Any]] = None):
+    galois = eng.galois
+    galois_state = dict(
+        mu_buf=np.array(galois.mu_buf, dtype=np.float64),
+        S_buf=np.array(galois.S_buf, dtype=np.float64),
+        _step=int(galois._step),
+        hazard_ema=float(galois.hazard_ema),
+        _Q=galois._Q.copy(),
+        has_map=(galois._map is not None),
+        map_W=(galois._map.W.copy() if galois._map is not None else None),
+        map_V=(galois._map.V.copy() if galois._map is not None else None),
+        pade=asdict(galois.pade),
+        policy=asdict(galois.policy),
+        window=int(galois.window),
+        period=int(galois.period),
+        ema=float(galois.ema),
+    )
+    state = dict(
+        step=int(step),
+        np_rng_state=np_rng_state,
+        engine=dict(
+            V=eng.V, d=eng.d, H=eng.H, L=eng.L, r=eng.r, seed=eng.seed,
+            logit_gain=float(eng.logit_gain),
+            STRICT_MATMUL=bool(STRICT_MATMUL),
+        ),
+        student_state=eng.student.state_dict(),
+        teacher_state=eng.teacher.state_dict(),
+        teacher_cfg=asdict(eng.teacher.cfg),
+        student_mem_cfg=asdict(eng.student_mem_cfg),
+        student_mem_state=eng.student_mem.state_dict(),
+        galois=galois_state,
+        tokenizer_state=(eng.tokenizer.state_dict() if eng.tokenizer is not None else None),
+    )
+    np.savez_compressed(ckpt_path, blob=np.array([state], dtype=object))
+
+def load_checkpoint(ckpt_path: str, allow_pickle: bool = False) -> Dict[str, Any]:
+    data = np.load(ckpt_path, allow_pickle=allow_pickle)
+    blob = data["blob"][0] if "blob" in data else data
+    if hasattr(blob, "item") and not isinstance(blob, dict):
+        blob = blob.item()
+    if not isinstance(blob, dict):
+        raise ValueError("Checkpoint did not contain a dict payload")
+    return blob
+
+def apply_checkpoint(eng: SpiralV9, ckpt: Dict[str, Any]) -> Tuple[int, Optional[Dict[str, Any]]]:
+    global STRICT_MATMUL
+    STRICT_MATMUL = bool(ckpt.get("engine", {}).get("STRICT_MATMUL", STRICT_MATMUL))
+    eng.logit_gain = float(ckpt.get("engine", {}).get("logit_gain", eng.logit_gain))
+    eng.student.load_state(ckpt["student_state"])
+    eng.teacher.load_state(ckpt["teacher_state"])
+    eng.teacher.cfg = TeacherCfg(**ckpt.get("teacher_cfg", asdict(eng.teacher.cfg)))
+    eng.student_mem_cfg = MemoryCfg(**ckpt.get("student_mem_cfg", asdict(eng.student_mem_cfg)))
+    eng.student_mem = EpisodicMemory(r=eng.r, V=eng.V, cfg=eng.student_mem_cfg, seed=777 + eng.seed)
+    eng.student_mem.load_state(ckpt.get("student_mem_state"))
+    tok_state = ckpt.get("tokenizer_state")
+    if tok_state is not None:
+        tok = SpiralTokenizer.from_state(tok_state)
+        if tok.vocab_size != eng.V:
+            raise ValueError(f"Tokenizer vocab {tok.vocab_size} != engine V {eng.V}")
+        eng.tokenizer = tok
+    g = ckpt.get("galois")
+    if g is not None:
+        eng.galois.mu_buf = [x for x in np.array(g.get("mu_buf", []), dtype=np.float64)] if np.array(g.get("mu_buf", [])).size else []
+        eng.galois.S_buf = [x for x in np.array(g.get("S_buf", []), dtype=np.float64)] if np.array(g.get("S_buf", [])).size else []
+        eng.galois._step = int(g.get("_step", 0))
+        eng.galois.hazard_ema = float(g.get("hazard_ema", 0.0))
+        eng.galois._Q = np.array(g.get("_Q", np.eye(eng.r) * 1e-3), dtype=np.float64)
+        eng.galois.pade = PadeSpec(**g.get("pade", asdict(eng.galois.pade)))
+        eng.galois.policy = GaloisPolicy(**g.get("policy", asdict(eng.galois.policy)))
+        eng.galois.window = int(g.get("window", eng.galois.window))
+        eng.galois.period = int(g.get("period", eng.galois.period))
+        eng.galois.ema = float(g.get("ema", eng.galois.ema))
+        if g.get("has_map", False):
+            num_basis = build_poly_basis(eng.r, PolySpec(deg=eng.galois.pade.p_deg, include_const=True), for_den=False)
+            den_basis = build_poly_basis(eng.r, PolySpec(deg=eng.galois.pade.q_deg, include_const=False), for_den=True)
+            eng.galois._map = RationalPadeMap(W=np.array(g.get("map_W")), V=np.array(g.get("map_V")),
+                                              num_basis=num_basis, den_basis=den_basis)
+    step = int(ckpt.get("step", 0))
+    np_state = ckpt.get("np_rng_state")
+    return step, np_state
 
     @classmethod
     def load(cls, path: str, allow_pickle: bool = False) -> "SpiralV9":
@@ -2804,6 +2892,13 @@ class SpiralV9:
 
     def train(self, cfg: TrainCfg, data_tokens: Optional[np.ndarray] = None) -> List[Dict[str, float]]:
         rng = np.random.default_rng(0)
+        start_step = int(getattr(cfg, "start_step", 0))
+        rng_state = getattr(cfg, "rng_state", None)
+        if rng_state is not None:
+            try:
+                rng.bit_generator.state = rng_state
+            except Exception:
+                pass
         logs = []
         bos_id = getattr(self.tokenizer, "bos_id", 2)
         eos_id = getattr(self.tokenizer, "eos_id", 3)
@@ -2844,7 +2939,7 @@ class SpiralV9:
         bandit_ctrl = HazardBanditController(self.student.cfg.L, cfg.hazard_bandit, seed=self.seed + 4242)
         bandit_actions = bandit_ctrl.select()
         last_ce = None
-        for step in range(cfg.steps):
+        for step in range(start_step, cfg.steps):
             Bn = cfg.batch
             gain = float(self.logit_gain)
             if train_tokens is None:
@@ -3069,6 +3164,15 @@ class SpiralV9:
                       f"keepk={self.student._keepk.tolist()} rho={self.student.u.rho.tolist()} "
                       f"hazards_t={hazard_teach.tolist()} hazards_g={hazard_grad.tolist()} embed_dnorm={embed_delta:.4e} embed_gnorm={embed_gnorm:.4e} | "
                       f"rag_w[min/mean/max]={rag_stats['rag_min']:.3f}/{rag_stats['rag_mean']:.3f}/{rag_stats['rag_max']:.3f}")
+            if cfg.ckpt_dir and cfg.save_every > 0 and ((step + 1) % cfg.save_every == 0):
+                os.makedirs(cfg.ckpt_dir, exist_ok=True)
+                ckpt_path = os.path.join(cfg.ckpt_dir, f"ckpt_step_{step+1:06d}.npz")
+                save_checkpoint(ckpt_path, self, step=step + 1, np_rng_state=rng.bit_generator.state)
+                ckpt_glob = os.path.join(cfg.ckpt_dir, "ckpt_step_*.npz")
+                ckpts = sorted(glob.glob(ckpt_glob))
+                if cfg.keep_last > 0 and len(ckpts) > cfg.keep_last:
+                    for old in ckpts[:len(ckpts) - cfg.keep_last]:
+                        os.remove(old)
         return logs
 
 # ------------------------------
@@ -3158,6 +3262,10 @@ def demo(args=None):
     p.add_argument("--galois_disable", action="store_true", help="disable galois online knob controller")
     p.add_argument("--galois_every", type=int, default=1, help="galois update cadence (steps)")
     p.add_argument("--strict_matmul", action="store_true", help="disable safe_matmul sanitization for debugging")
+    p.add_argument("--ckpt_dir", type=str, default=None, help="checkpoint directory (npz snapshots)")
+    p.add_argument("--save_every", type=int, default=0, help="checkpoint save interval (steps)")
+    p.add_argument("--resume", action="store_true", help="resume from latest checkpoint in ckpt_dir")
+    p.add_argument("--keep_last", type=int, default=3, help="how many checkpoints to keep")
     parsed = p.parse_args(args=args)
 
     global STRICT_MATMUL
@@ -3219,6 +3327,16 @@ def demo(args=None):
         eng = SpiralV9(V=vocab_override, d=parsed.d, H=parsed.H, L=parsed.L, r=parsed.r,
                        seed=parsed.seed, teacher_cfg=teacher_cfg)
 
+    start_step = 0
+    rng_state = None
+    if parsed.ckpt_dir and parsed.resume:
+        ckpt_glob = os.path.join(parsed.ckpt_dir, "ckpt_step_*.npz")
+        ckpts = sorted(glob.glob(ckpt_glob))
+        if ckpts:
+            ckpt = load_checkpoint(ckpts[-1], allow_pickle=parsed.allow_pickle_load)
+            start_step, rng_state = apply_checkpoint(eng, ckpt)
+            print(f"[ckpt] Resumed from {ckpts[-1]} at step {start_step}")
+
     if parsed.override_rag:
         eng.teacher.cfg.rag_m = parsed.rag_m
         eng.teacher.cfg.rag_w = parsed.rag_w
@@ -3256,7 +3374,9 @@ def demo(args=None):
                        keepk_boost=1, rho_boost=0.0, backprop_T=True, T_grad_scale=0.1,
                        data_path=parsed.data_path, logit_gain=parsed.logit_gain,
                        galois_enable=not parsed.galois_disable, galois_every=parsed.galois_every,
-                       hazard_bandit=bandit_cfg)
+                       hazard_bandit=bandit_cfg,
+                       start_step=start_step, rng_state=rng_state,
+                       ckpt_dir=parsed.ckpt_dir, save_every=parsed.save_every, keep_last=parsed.keep_last)
         logs = eng.train(cfg, data_tokens=data_tokens)
         if logs and parsed.log_path:
             with open(parsed.log_path, "w", encoding="utf-8") as f:
