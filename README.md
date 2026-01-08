@@ -26,12 +26,14 @@ You’ll get a brisk training run that paints the loop: generate → reliability
 - **Checkpoint everything**: tokenizer, teacher (including reliability trackers and RAG weights), student, and shared projection are all packed into a single `.npz` via `save_weights`.
 - **Resume or just decode**: `--load_path` restores a checkpoint; set `--steps 0` to skip training and jump straight to inference.
 - **Seeded nucleus sampling**: control stochastic decoding with `--rng_seed`, `--temperature`, `--top_p`, and optional `--top_k`, generating text (if tokenizer present) or raw token IDs.
-- **Custom data or text**: point `--data_path` at a NumPy token array, or `--text_path` at UTF-8 text to train the built-in byte-level tokenizer (configurable with `--tok_*` flags).
+- **Custom data or text**: point `--data_path` at a NumPy token array, or `--text_path`/`--text_paths` at UTF-8 text (supports globs + multiple files) to train the built-in byte-level tokenizer (configurable with `--tok_*` flags).
 - **Reproducible spins**: use `--seed` to set the base seed for synthetic bigram data and initial weights when starting fresh.
 - **Memory traces per token**: enable `--mem_trace` to print a per-step breakdown of episodic memory influence: top neighbors (similarity/weight/strength/usage), their per-token Δlogit pushes, aggregated boosts, and whether the chosen token was helped by memory. Tune verbosity with `--mem_trace_neighbors`, `--mem_trace_tokens`, and silence empty retrievals via `--mem_trace_only_used`. Override memory logit scaling during generation with `--mem_scale`.
 - **Heatmap “X-ray” mode**: pair `--mem_trace` with `--mem_heatmap` to stream a rolling matplotlib heatmap of memory-driven Δlogits across the last 200 generation steps (configurable via `--mem_heatmap_top`/`--mem_heatmap_steps`).
 - **Self-dialogue taps the teacher**: when the student is uncertain, `--self_dialog` runs a one-off teacher forward pass and injects its top tokens back into the logits (scaled by uncertainty). Tune with `--self_dialog_margin`, `--self_dialog_entropy`, `--self_dialog_top`, and `--self_dialog_alpha`.
 - **Hazard bandit**: flip `--hazard_bandit` to let a per-layer two-armed bandit pick safe vs. risky modes (keep_k / LR deltas) with survival bonuses and spike penalties. Adjust deltas and thresholds via the `--bandit_*` flags.
+- **Galois controller**: enable Padé/Floquet hazard control for `T0`/`rag_weight`/`keep_k` updates; use `--galois_disable` to turn it off or `--galois_every` to tune cadence.
+- **Strict matmul debugging**: use `--strict_matmul` to disable NaN/Inf scrubbing in `safe_matmul` and surface numerical issues.
 - **Meta-Sleep attention**: the rank-k attention layers now track meta statistics of keys (EMA mean/var + Oja PCA) and can slowly integrate “sleep” memories with whitening and shrinkage. Enable with `StudentCfg.meta_sleep.enable` in code to experiment with delayed consolidation.
 
 ## Usage samples
@@ -44,6 +46,11 @@ Train on your text (tokenizer auto-trained), then decode:
 ```bash
 python SpiralFullFusion_toy.py --text_path my_corpus.txt --tok_vocab 512 --steps 300 --save_path /tmp/spiral_text.npz
 python SpiralFullFusion_toy.py --steps 0 --load_path /tmp/spiral_text.npz --prompt "hello spiral" --max_new_tokens 32 --rng_seed 123
+```
+
+Train on multiple text files (globs allowed):
+```bash
+python SpiralFullFusion_toy.py --text_paths "./data/*.txt" "./more_corpus.txt" --tok_vocab 512 --steps 300
 ```
 
 Decode from a saved checkpoint using token IDs:

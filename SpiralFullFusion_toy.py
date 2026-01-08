@@ -4,11 +4,14 @@
 # NumPy-only, single-file demo. Safe initializations and eps clamps to avoid NaNs.
 from dataclasses import dataclass, asdict, field
 from typing import List, Tuple, Optional, Dict, Any
+import glob
+import math
 import numpy as np
 import re
 import importlib.util
 
 EPS = 1e-8
+STRICT_MATMUL = False
 
 # ------------------------------
 # utils
@@ -28,6 +31,8 @@ def safe_tanh(x: np.ndarray) -> np.ndarray:
     return np.tanh(np.clip(x, -10.0, 10.0)).astype(np.float32)
 
 def safe_matmul(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    if STRICT_MATMUL:
+        return (a @ b).astype(np.float32)
     a_clean = np.nan_to_num(a, nan=0.0, posinf=1e3, neginf=-1e3).astype(np.float32)
     b_clean = np.nan_to_num(b, nan=0.0, posinf=1e3, neginf=-1e3).astype(np.float32)
     with np.errstate(invalid='ignore', over='ignore', divide='ignore'):
@@ -36,7 +41,7 @@ def safe_matmul(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     return y
 
 
-def apply_logit_gain(logits: np.ndarray, gain: float, target_std: float = 1.5, max_scale: float = 20000.0) -> Tuple[np.ndarray, float]:
+def apply_logit_gain(logits: np.ndarray, gain: float, target_std: float = 1.5, max_scale: float = 1000.0) -> Tuple[np.ndarray, float]:
     """
     Rescale logits to avoid near-uniform outputs.
       - gain > 0: use directly (clamped to max_scale)
@@ -51,6 +56,170 @@ def apply_logit_gain(logits: np.ndarray, gain: float, target_std: float = 1.5, m
         g = target_std / max(std, 1e-6)
     g = float(np.clip(g, 1e-3, max_scale))
     return (logits * g).astype(np.float32), g
+
+def rand_orth(r: int, cols: int, rng: np.random.Generator) -> np.ndarray:
+    A = rng.normal(0, 1, size=(r, cols)).astype(np.float32)
+    Q, _ = np.linalg.qr(A)
+    return Q[:, :cols].astype(np.float32)
+
+def coa_from_logits_and_varB(logits: np.ndarray, var_diag: np.ndarray, Bmat: np.ndarray) -> float:
+    V = logits.shape[0]
+    if V < 2:
+        return 1.0
+    top2 = np.argpartition(logits, -2)[-2:]
+    top2 = top2[np.argsort(-logits[top2])]
+    j, k2 = int(top2[0]), int(top2[1])
+    bdiff = (Bmat[:, j] - Bmat[:, k2])
+    var_delta = float(np.sum(var_diag * (bdiff * bdiff)) + 1e-12)
+    delta = float(logits[j] - logits[k2])
+    return float(0.5 * (1.0 + math.erf(delta / (math.sqrt(var_delta) * math.sqrt(2.0) + 1e-9))))
+
+@dataclass
+class KernelCfg:
+    alpha: float = 0.25
+    tau: float = 0.05
+    phi_max: float = 0.15
+    rho_max: float = 0.6
+    ellip_mode: str = "cone_link"
+    ellip_r0: float = 1.2
+    ellip_gain: float = 0.8
+    ellip_min: float = 0.6
+    ellip_max: float = 2.5
+    delta_base: float = 1.5
+
+class MoralityKernel:
+    def __init__(self,
+                 Ub: Optional[np.ndarray],
+                 Uh: Optional[np.ndarray],
+                 Us: Optional[np.ndarray],
+                 Lambda_harm: Optional[np.ndarray],
+                 cfg: KernelCfg):
+        self.Ub = Ub.astype(np.float32) if Ub is not None else None
+        self.Uh = Uh.astype(np.float32) if Uh is not None else None
+        self.Us = Us.astype(np.float32) if Us is not None else None
+        self.cfg = cfg
+
+        if self.Uh is not None:
+            if Lambda_harm is None:
+                Lambda_harm = np.ones((self.Uh.shape[1],), dtype=np.float32)
+            self.Lh = np.sqrt(np.maximum(np.asarray(Lambda_harm, dtype=np.float32), 1e-6))
+        else:
+            self.Lh = None
+
+        self.mu_prev: Optional[np.ndarray] = None
+        self.sigma_ema = 0.0
+        self.kappa_ema = 0.0
+        self._ema_beta = 0.9
+
+    def _ellip_R(self, mu: np.ndarray) -> float:
+        if self.cfg.ellip_mode == "fixed":
+            R = self.cfg.ellip_r0
+        elif self.cfg.ellip_mode == "ben_linear":
+            bn = float(np.linalg.norm(self.Ub.T @ mu)) if self.Ub is not None else 0.0
+            R = self.cfg.ellip_r0 * (1.0 + self.cfg.ellip_gain * bn)
+        else:
+            bn = float(np.linalg.norm(self.Ub.T @ mu)) if self.Ub is not None else 0.0
+            R0 = self.cfg.alpha * bn + self.cfg.tau
+            R = self.cfg.ellip_r0 * (1.0 + self.cfg.ellip_gain * R0)
+        return float(np.clip(R, self.cfg.ellip_min, self.cfg.ellip_max))
+
+    def _cone_guard(self, mu: np.ndarray) -> np.ndarray:
+        if self.Uh is None or self.Ub is None:
+            return mu
+        h = float(np.linalg.norm(self.Uh.T @ mu))
+        b = float(np.linalg.norm(self.Ub.T @ mu)) + 1e-6
+        if h > self.cfg.alpha * b + self.cfg.tau:
+            mu = mu - 0.5 * (self.Uh @ (self.Uh.T @ mu))
+        return mu
+
+    def _ellip_guard(self, mu: np.ndarray) -> np.ndarray:
+        if self.Uh is None or self.Lh is None:
+            return mu
+        z = self.Uh.T @ mu
+        energy = float(np.linalg.norm(self.Lh * z))
+        R = self._ellip_R(mu)
+        if energy <= R:
+            return mu
+        s = max(1e-6, R / (energy + 1e-12))
+        z_new = s * z
+        mu_par = self.Uh @ z
+        mu_par_new = self.Uh @ z_new
+        mu_perp = mu - mu_par
+        return mu_perp + mu_par_new
+
+    def measures(self,
+                 mu_target: np.ndarray,
+                 mu_curr: np.ndarray,
+                 dmu: np.ndarray,
+                 var_diag: np.ndarray,
+                 ECE_bar: float,
+                 COA: float,
+                 q_rag: float) -> Dict[str, float]:
+        rho = 0.0
+        if self.Uh is not None and self.Ub is not None:
+            h = float(np.linalg.norm(self.Uh.T @ mu_target))
+            b = float(np.linalg.norm(self.Ub.T @ mu_target)) + 1e-6
+            rho = h / (b + 1e-6)
+
+        inv = 1.0 / np.maximum(var_diag, 1e-8)
+        speed = float(np.sqrt(np.sum((dmu * dmu) * inv)))
+
+        if self.mu_prev is None:
+            kappa = 0.0
+        else:
+            v1 = dmu
+            v0 = (mu_target - self.mu_prev)
+            denom = (np.linalg.norm(v1) * np.linalg.norm(v0) + 1e-9)
+            c = float(np.dot(v1, v0) / denom)
+            kappa = float(np.arccos(np.clip(c, -1.0, 1.0)))
+
+        sigma = 0.0
+        if self.Us is not None and self.Uh is not None:
+            num = float(np.linalg.norm(self.Us.T @ dmu))
+            den = float(np.linalg.norm(self.Uh.T @ dmu)) + 1e-8
+            sigma = num / den
+
+        self.sigma_ema = self._ema_beta * self.sigma_ema + (1.0 - self._ema_beta) * sigma
+        self.kappa_ema = self._ema_beta * self.kappa_ema + (1.0 - self._ema_beta) * kappa
+
+        delta = self.cfg.delta_base * (1.0 + 0.8 * ECE_bar) * (1.0 - 0.6 * COA) * (1.0 - 0.5 * q_rag)
+        return dict(rho=float(rho), speed=float(speed), kappa=float(self.kappa_ema),
+                    sigma=float(self.sigma_ema), delta=float(delta))
+
+    def project(self,
+                mu_prop: np.ndarray,
+                mu_curr: np.ndarray,
+                var_diag: np.ndarray,
+                ECE_bar: float,
+                COA: float,
+                q_rag: float) -> Tuple[np.ndarray, float, Dict[str, float]]:
+        mu = mu_prop.copy()
+        mu = self._cone_guard(mu)
+        mu = self._ellip_guard(mu)
+
+        dmu = mu - mu_curr
+        cert = self.measures(mu, mu_curr, dmu, var_diag, ECE_bar, COA, q_rag)
+
+        inv = 1.0 / np.maximum(var_diag, 1e-8)
+        speed = float(np.sqrt(np.sum((dmu * dmu) * inv)))
+        if speed > cert["delta"]:
+            s = max(1e-6, cert["delta"] / (speed + 1e-12))
+            mu = mu_curr + s * (mu - mu_curr)
+            dmu = mu - mu_curr
+            cert = self.measures(mu, mu_curr, dmu, var_diag, ECE_bar, COA, q_rag)
+
+        allow = (cert["rho"] <= self.cfg.rho_max) and (cert["speed"] <= cert["delta"])
+        phi = self.cfg.phi_max if allow else 0.0
+
+        ben = (self.Ub @ (self.Ub.T @ mu_curr)) if self.Ub is not None else np.zeros_like(mu_curr)
+        sig_h = 1.0 / (1.0 + np.exp(-8.0 * (cert["rho"] - self.cfg.rho_max)))
+        beta = float(np.clip(0.10 * sig_h * (1.0 - ECE_bar) * (1.0 - q_rag), 0.0, 0.6))
+        alpha = float(np.clip(0.05 * (1.0 - q_rag), 0.0, 0.6))
+        w0 = float(np.clip(1.0 - alpha - beta, 0.0, 1.0))
+        mu_fused = w0 * mu + alpha * mu_curr + beta * ben
+
+        self.mu_prev = mu_curr.copy()
+        return mu_fused.astype(np.float32), float(phi), cert
 
 # ------------------------------
 # Pure-Python tokenizer (byte-level BPE-ish)
@@ -407,7 +576,7 @@ def sample_batch_bigram(P: np.ndarray, ctx_len: int, B: int, rng: np.random.Gene
         prev = tokens[:, t - 1]
         u = rng.random((B,))
         cdf = np.cumsum(P[prev], axis=1)
-        tokens[:, t] = (u[:, None] > cdf).sum(axis=1)
+        tokens[:, t] = np.minimum((u[:, None] > cdf).sum(axis=1), V - 1)
     ctx = tokens[:, :ctx_len].copy()
     y = tokens[:, ctx_len].copy()
     return ctx, y
@@ -561,9 +730,9 @@ def rag_bcsr_ngram(tokens_batch: np.ndarray, vocab_size: int, bigram_P: np.ndarr
     return ("bcsr", np.array(indptr, dtype=np.int64), indices, data)
 
 # ------------------------------
-# Teacher: ToyDeepLM + BayesHeadFuseLR + Reliability tracking + RAG SHAP
+# Teacher: ToyDeepLMT + BayesHeadFuseLR + Reliability tracking + RAG SHAP
 # ------------------------------
-class ToyDeepLM:
+class ToyDeepLMT:
     def __init__(self, V: int, d: int, H: int, L: int, seed: int = 0):
         self.V, self.d, self.H, self.L = V, d, H, L
         rng = np.random.default_rng(seed)
@@ -693,7 +862,7 @@ class MemoryCfg:
     store_m: int = 8             # store top-m tokens per entry
     retrieve_k: int = 16         # retrieve top-k nearest entries
     sim_temp: float = 0.07       # softmax temperature for neighbor weighting
-    min_sim: float = 0.20        # if best similarity < min_sim -> don't use memory
+    min_sim: float = 0.12        # if best similarity < min_sim -> don't use memory
     logit_scale: float = 1.5     # how strongly memory distribution boosts logits
     decay: float = 0.9995        # global strength decay per teacher.forward_batch call
     touch_alpha: float = 0.025   # strengthen retrieved entries
@@ -707,7 +876,7 @@ class MemoryCfg:
 
     # insertion gating (only during training when targets are available)
     add_rate: float = 0.50       # subsample insertions (0..1)
-    add_prob_thr: float = 0.35   # insert only if teacher prob(y) >= thr
+    add_prob_thr: float = 0.10   # insert only if teacher prob(y) >= thr
     add_T_thr: float = 1.20      # and teacher temperature <= thr
     min_store_prob: float = 0.02 # if target not in top-m, force-insert with at least this prob
 
@@ -943,11 +1112,12 @@ class EpisodicMemory:
             self.used[:n] = used[:n].astype(np.int32)
 
 class SpiralTeacher:
-    def __init__(self, V: int, d: int, H: int, L: int, r: int, P: np.ndarray, cfg: TeacherCfg, seed: int = 0):
+    def __init__(self, V: int, d: int, H: int, L: int, r: int, P: np.ndarray, cfg: TeacherCfg,
+                 seed: int = 0, kernel: Optional[MoralityKernel] = None):
         self.V, self.d, self.H, self.L, self.r = V, d, H, L, r
         self.P = P; self.cfg = cfg
         self.trigram_map: Optional[Dict[Tuple[int, int], np.ndarray]] = bootstrap_trigram_from_bigram(P, seed=seed)
-        self.lm = ToyDeepLM(V, d, H, L, seed=seed)
+        self.lm = ToyDeepLMT(V, d, H, L, seed=seed)
         self.fusers = [BayesHeadFuseLR(d, V, H, r, rho=0.7, tau0=1e-4, seed=seed + l) for l in range(L)]
         # share B across layers
         B0 = self.fusers[0].B
@@ -956,9 +1126,15 @@ class SpiralTeacher:
         self.rel = ReliabilityTracker(L, H, ema=0.7)
         # rag source weights (per vocab id) for SHAP attenuation
         self.rag_src_weight = np.ones((V,), dtype=np.float32)
+        self.kernel = kernel
+        self.ece_ema = 0.2
+        self._ece_beta = 0.9
         # ---- episodic memory (kNN-RAG) ----
         self.mem_cfg = MemoryCfg()
         self.mem = EpisodicMemory(r=self.r, V=self.V, cfg=self.mem_cfg, seed=seed + 999)
+
+    def set_ece(self, ece: float):
+        self.ece_ema = self._ece_beta * self.ece_ema + (1.0 - self._ece_beta) * float(ece)
 
     def _rag_rank_mu_delta(self, indices: np.ndarray, scores: np.ndarray) -> Optional[np.ndarray]:
         if indices.size == 0: return None
@@ -995,6 +1171,8 @@ class SpiralTeacher:
 
         # reliability accumulators for RAG SHAP
         rag_attr: Dict[int, float] = {}
+        kernel_certs: List[Dict[str, float]] = []
+        kernel_norms: List[float] = []
 
         # memory stats
         mem_used = 0
@@ -1018,9 +1196,17 @@ class SpiralTeacher:
                     rel = float(np.mean(taus[h]))
                     self.rel.update(l, h, dom, rel)
 
-            # posterior across layers (simple chain)
-            mu_post, var_post = mu_l[-1], var_l[-1]
-            # state regularization could be added here
+            # posterior across layers (precision fusion with reliability weighting)
+            tau_sum = np.zeros((self.r,), dtype=np.float32) + 1e-6
+            mu_num = np.zeros((self.r,), dtype=np.float32)
+            for l in range(self.L):
+                tau_l = 1.0 / np.maximum(var_l[l], 1e-6)
+                rel_l = float(np.clip(np.mean(self.rel.y[l]), 0.1, 10.0))
+                tau_w = tau_l * rel_l
+                tau_sum += tau_w
+                mu_num += tau_w * mu_l[l]
+            mu_post = mu_num / tau_sum
+            var_post = 1.0 / tau_sum
 
             # logits before RAG
             logits_b = self.fusers[-1].logits_from_mu(mu_post)
@@ -1038,7 +1224,20 @@ class SpiralTeacher:
                 # rank delta for audit + SHAP
                 mu_d = self._rag_rank_mu_delta(inds, vals)
                 if mu_d is not None:
-                    mu_post = (mu_post + mu_d).astype(np.float32)
+                    mu_prop = (mu_post + mu_d).astype(np.float32)
+                    if self.kernel is not None:
+                        q_rag = float(np.tanh(np.linalg.norm(mu_d)))
+                        coa = coa_from_logits_and_varB(logits_b, var_post, self.B)
+                        mu_safe, phi, cert = self.kernel.project(mu_prop, mu_post, var_post,
+                                                                 ECE_bar=self.ece_ema,
+                                                                 COA=coa,
+                                                                 q_rag=q_rag)
+                        mu_post = mu_safe
+                        var_post = (1.0 - phi) * var_post
+                        kernel_certs.append(cert)
+                        kernel_norms.append(float(np.linalg.norm(mu_d)))
+                    else:
+                        mu_post = mu_prop
                     # SHAP-ish attribution with reliability of last layer
                     _, stab, _ = self.rel.layer_stats()
                     y_rel = (stab[-1] + 1.0)  # crude proxy: stabilizers weight=2, others=1
@@ -1061,7 +1260,20 @@ class SpiralTeacher:
                     # optional: rank-space injection (keeps internal story coherent)
                     mu_dm = self._rag_rank_mu_delta(inds_m, vals_m)
                     if mu_dm is not None:
-                        mu_post = (mu_post + mu_dm).astype(np.float32)
+                        mu_prop = (mu_post + mu_dm).astype(np.float32)
+                        if self.kernel is not None:
+                            q_rag = float(np.tanh(np.linalg.norm(mu_dm)))
+                            coa = coa_from_logits_and_varB(logits_b, var_post, self.B)
+                            mu_safe, phi, cert = self.kernel.project(mu_prop, mu_post, var_post,
+                                                                     ECE_bar=self.ece_ema,
+                                                                     COA=coa,
+                                                                     q_rag=q_rag)
+                            mu_post = mu_safe
+                            var_post = (1.0 - phi) * var_post
+                            kernel_certs.append(cert)
+                            kernel_norms.append(float(np.linalg.norm(mu_dm)))
+                        else:
+                            mu_post = mu_prop
                         logits_b = self.fusers[-1].logits_from_mu(mu_post)
 
                     mem_used += 1
@@ -1140,8 +1352,14 @@ class SpiralTeacher:
         mem_reward_frac = float(mem_rewarded) / max(1, mem_used)
         mem_punish_frac = float(mem_punished) / max(1, mem_used)
 
+        kernel_cert_avg = dict(rho=0.0, speed=0.0, kappa=0.0, sigma=0.0, delta=1.0)
+        if kernel_certs:
+            for k in kernel_cert_avg.keys():
+                kernel_cert_avg[k] = float(np.mean([c.get(k, 0.0) for c in kernel_certs]))
+        kernel_rag_norm = float(np.mean(kernel_norms)) if kernel_norms else 0.0
+
         gain = float(self.cfg.logit_gain if logit_gain is None else logit_gain)
-        logits, gain_used = apply_logit_gain(logits, gain, target_std=1.5, max_scale=20000.0)
+        logits, gain_used = apply_logit_gain(logits, gain, target_std=1.5, max_scale=1000.0)
 
         meta = dict(
             meanVar=float(meanVars.mean()),
@@ -1153,6 +1371,8 @@ class SpiralTeacher:
             mem_mean_strength=mem_mean_strength,
             mem_reward_frac=mem_reward_frac,
             mem_punish_frac=mem_punish_frac,
+            kernel_cert_avg=kernel_cert_avg,
+            kernel_rag_norm=kernel_rag_norm,
             logit_gain_used=float(gain_used),
         )
         return logits, Ts, meanVars, meta
@@ -1207,7 +1427,7 @@ class SpiralTeacher:
 # ------------------------------
 # Student: Rank-K blocks + RankParamHead + UncertaintyLR + T_S(Σ) backprop (approx)
 # ------------------------------
-class Linear:
+class LinearS:
     def __init__(self, din: int, dout: int, rng):
         self.W = (rng.normal(0, 0.02, size=(din, dout)) / np.sqrt(max(1, din))).astype(np.float32)
         self.b = np.zeros((dout,), dtype=np.float32)
@@ -1231,7 +1451,7 @@ class Linear:
         self.W -= lr * dWc; self.b -= lr * dbc
         self.dW.fill(0.0); self.db.fill(0.0)
 
-class Embedding:
+class EmbeddingS:
     def __init__(self, V: int, d: int, rng):
         self.W = (rng.normal(0, 0.02, size=(V, d)) / np.sqrt(max(1, d))).astype(np.float32)
         self.dW = np.zeros_like(self.W); self._idx = None
@@ -1250,7 +1470,7 @@ class Embedding:
         self.W -= lr * dWc
         self.dW.fill(0.0)
 
-class SiLU:
+class SiLUS:
     def __init__(self): self._x = None
     def forward(self, x: np.ndarray) -> np.ndarray: self._x = x; return silu(x)
     def backward(self, dy: np.ndarray) -> np.ndarray:
@@ -1273,7 +1493,7 @@ class MetaSleepCfg:
 
 class RankKAttention:
     def __init__(self, d: int, k: int, rng, meta_cfg: Optional[MetaSleepCfg] = None):
-        self.q = Linear(d, k, rng); self.k = Linear(d, k, rng); self.v = Linear(d, d, rng)
+        self.q = LinearS(d, k, rng); self.k = LinearS(d, k, rng); self.v = LinearS(d, d, rng)
         self.kdim = k; self._cache = None
         self.meta_cfg = meta_cfg or MetaSleepCfg()
         r = int(np.clip(self.meta_cfg.pca_rank, 1, self.kdim))
@@ -1351,7 +1571,9 @@ class RankKAttention:
             proj = np.tensordot(kfull.reshape(-1, self.kdim), u, axes=1)
             du = lr * (kfull.reshape(-1, self.kdim).T @ (proj)) / max(1, kfull.size // self.kdim)
             u = u + du
-            u = u - np.sum(self.meta_U[:, :r] * u[:, None], axis=1)
+            if r > 0:
+                proj = self.meta_U[:, :r].T @ u
+                u = u - self.meta_U[:, :r] @ proj
             self.meta_U[:, r] = u / max(1e-6, np.linalg.norm(u))
 
     def _meta_proj(self, keep_k: int) -> np.ndarray:
@@ -1392,7 +1614,7 @@ class RankKAttention:
 
 class FFN:
     def __init__(self, d: int, rng):
-        self.fc1 = Linear(d, 4 * d, rng); self.act = SiLU(); self.fc2 = Linear(4 * d, d, rng)
+        self.fc1 = LinearS(d, 4 * d, rng); self.act = SiLUS(); self.fc2 = LinearS(4 * d, d, rng)
     def forward(self, x: np.ndarray) -> np.ndarray:
         return self.fc2.forward(self.act.forward(self.fc1.forward(x)))
     def backward(self, dy: np.ndarray) -> np.ndarray:
@@ -1412,20 +1634,23 @@ class SpiralBlock:
 
 class RankParamHead:
     def __init__(self, d: int, r: int, rng):
-        self.mean = Linear(d, r, rng); self.logtau = Linear(d, r, rng)
+        self.mean = LinearS(d, r, rng); self.logtau = LinearS(d, r, rng)
         self._last = None
     def forward(self, h_last: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         # h_last: [B,T,d] → use last token state
         last = h_last[:, -1, :]
         mu = self.mean.forward(last)                       # [B,r]
-        lt = np.clip(self.logtau.forward(last), -6.0, 6.0) # [B,r]
+        lt_raw = self.logtau.forward(last)
+        lt = np.clip(lt_raw, -6.0, 6.0)                    # [B,r]
         tau = np.exp(lt) + 1e-6
-        self._last = dict(last=last, lt=lt, tau=tau)
+        clip_mask = (lt_raw == lt).astype(np.float32)
+        self._last = dict(last=last, lt=lt, tau=tau, clip_mask=clip_mask)
         return mu.astype(np.float32), tau.astype(np.float32)
     def backward(self, dmu: np.ndarray, dtau: np.ndarray) -> np.ndarray:
         # dmu, dtau: [B,r]
         # propagate to last-token features
-        dlast = self.mean.backward(dmu) + self.logtau.backward(dtau * np.exp(self._last["lt"]))
+        dlt = dtau * np.exp(self._last["lt"]) * self._last["clip_mask"]
+        dlast = self.mean.backward(dmu) + self.logtau.backward(dlt)
         B, d = dlast.shape
         dh = np.zeros((B, 1, d), dtype=np.float32)
         dh[:, -1, :] = dlast
@@ -1453,7 +1678,7 @@ class StudentV9:
     def __init__(self, cfg: StudentCfg, shared_B: np.ndarray):
         self.cfg = cfg
         rng = np.random.default_rng(cfg.seed)
-        self.embed = Embedding(cfg.V, cfg.d, rng)
+        self.embed = EmbeddingS(cfg.V, cfg.d, rng)
         self.blocks = [SpiralBlock(cfg.d, cfg.k, rng, meta_cfg=cfg.meta_sleep) for _ in range(cfg.L)]
         self.rank_head = RankParamHead(cfg.d, cfg.r, rng)
         self.B = shared_B.astype(np.float32)  # [r,V]
@@ -1461,7 +1686,7 @@ class StudentV9:
         self._keepk = np.full((cfg.L,), max(2, cfg.k), dtype=np.int32)
 
     # ------------------ persistence ------------------
-    def _linear_state(self, lin: Linear) -> Dict[str, np.ndarray]:
+    def _linear_state(self, lin: LinearS) -> Dict[str, np.ndarray]:
         return dict(W=lin.W.copy(), b=lin.b.copy())
 
     def state_dict(self) -> Dict[str, Any]:
@@ -1489,7 +1714,11 @@ class StudentV9:
         )
 
     def load_state(self, state: Dict[str, Any]):
-        self.cfg = StudentCfg(**state["cfg"])
+        cfg_raw = dict(state["cfg"])
+        meta_sleep_raw = cfg_raw.get("meta_sleep")
+        if isinstance(meta_sleep_raw, dict):
+            cfg_raw["meta_sleep"] = MetaSleepCfg(**meta_sleep_raw)
+        self.cfg = StudentCfg(**cfg_raw)
         self.B = state["B"].astype(np.float32)
         self._keepk = state["keepk"].astype(np.int32)
         self.u.rho = state["rho"].astype(np.float32)
@@ -1528,7 +1757,7 @@ class StudentV9:
         mu, tau = self.rank_head.forward(h)  # [B,r], [B,r]
         logits = safe_matmul(mu, self.B)     # [B,V]
         Sigma = 1.0 / np.maximum(tau, 1e-6)  # [B,r]
-        logits, gain_used = apply_logit_gain(logits, logit_gain, target_std=1.5, max_scale=20000.0)
+        logits, gain_used = apply_logit_gain(logits, logit_gain, target_std=1.5, max_scale=1000.0)
         return logits, dict(h=h, mu=mu, tau=tau, Sigma=Sigma, attn=attn_maps, logit_gain_used=float(gain_used))
 
     def backward(self, dlogits: np.ndarray, aux: Dict[str, Any], dSigma_from_T: Optional[np.ndarray] = None):
@@ -1862,6 +2091,317 @@ class HazardBanditController:
             self.fitness[l, act] = self.cfg.reward_ema * self.fitness[l, act] + (1.0 - self.cfg.reward_ema) * base
 
 # ------------------------------
+# Galois / Padé + Floquet + EKF Σ roll (online hazard controller)
+# ------------------------------
+def _eigvals(A: np.ndarray) -> np.ndarray:
+    try:
+        return np.linalg.eigvals(A)
+    except np.linalg.LinAlgError:
+        eps = 1e-6 * np.linalg.norm(A) + 1e-9
+        return np.linalg.eigvals(A + eps * np.eye(A.shape[0], dtype=A.dtype))
+
+@dataclass
+class PolySpec:
+    deg: int = 2
+    include_const: bool = True
+
+@dataclass
+class PolyBasis:
+    spec: PolySpec
+    pairs: Optional[List[Tuple[int, int]]] = None
+    dim: int = 0
+
+def build_poly_basis(r: int, spec: PolySpec, for_den: bool) -> PolyBasis:
+    deg = int(spec.deg)
+    pairs = None
+    dim = r
+    if deg >= 2:
+        pairs = [(j, k) for j in range(r) for k in range(j, r)]
+        dim += len(pairs)
+    if spec.include_const and (not for_den):
+        dim += 1
+    return PolyBasis(spec=spec, pairs=pairs, dim=dim)
+
+def poly_features(mu: np.ndarray, basis: PolyBasis) -> np.ndarray:
+    mu = np.asarray(mu)
+    *lead, r = mu.shape
+    out = [mu]
+    if basis.spec.deg >= 2 and basis.pairs is not None:
+        quads = []
+        for (j, k) in basis.pairs:
+            quads.append(mu[..., j] * mu[..., k])
+        out.append(np.stack(quads, axis=-1))
+    if basis.spec.include_const:
+        out.append(np.ones((*lead, 1), dtype=mu.dtype))
+    return np.concatenate(out, axis=-1)
+
+def poly_jac(mu: np.ndarray, r: int, basis: PolyBasis) -> np.ndarray:
+    mu = mu.reshape(r)
+    blocks = [np.eye(r, dtype=np.float64)]
+    if basis.spec.deg >= 2 and basis.pairs is not None:
+        rows = []
+        for (j, k) in basis.pairs:
+            row = np.zeros((r,), dtype=np.float64)
+            row[j] += mu[k]
+            row[k] += mu[j]
+            rows.append(row)
+        blocks.append(np.stack(rows, axis=0))
+    if basis.spec.include_const:
+        blocks.append(np.zeros((1, r), dtype=np.float64))
+    return np.concatenate(blocks, axis=0)
+
+@dataclass
+class PadeSpec:
+    p_deg: int = 2
+    q_deg: int = 1
+    ridge: float = 2e-4
+
+@dataclass
+class RationalPadeMap:
+    W: np.ndarray
+    V: np.ndarray
+    num_basis: PolyBasis
+    den_basis: PolyBasis
+
+    def __call__(self, mu: np.ndarray) -> np.ndarray:
+        phi = poly_features(mu, self.num_basis)
+        psi = poly_features(mu, self.den_basis)
+        num = self.W @ phi
+        den = 1.0 + self.V @ psi
+        den = np.where(np.abs(den) < 1e-6, np.sign(den) * 1e-6 + (den == 0), den)
+        return num / den
+
+    def jacobian(self, mu: np.ndarray) -> np.ndarray:
+        r = self.W.shape[0]
+        phi = poly_features(mu, self.num_basis)
+        psi = poly_features(mu, self.den_basis)
+        dphi = poly_jac(mu, r, self.num_basis)
+        dpsi = poly_jac(mu, r, self.den_basis)
+        num_vec = self.W @ phi
+        den_vec = 1.0 + self.V @ psi
+        J = np.zeros((r, r), dtype=np.float64)
+        for i in range(r):
+            g_num = self.W[i] @ dphi
+            g_den = self.V[i] @ dpsi
+            J[i, :] = (g_num * den_vec[i] - num_vec[i] * g_den) / (den_vec[i] ** 2 + 1e-12)
+        return J
+
+def fit_rational_pade(mu_t: np.ndarray, mu_tp1: np.ndarray, spec: PadeSpec) -> Tuple[RationalPadeMap, float]:
+    T, r = mu_t.shape
+    num_basis = build_poly_basis(r, PolySpec(deg=spec.p_deg, include_const=True), for_den=False)
+    den_basis = build_poly_basis(r, PolySpec(deg=spec.q_deg, include_const=False), for_den=True)
+    mp, mq = num_basis.dim, den_basis.dim
+    Phi = poly_features(mu_t, num_basis)
+    Psi = poly_features(mu_t, den_basis)
+
+    W = np.zeros((r, mp), dtype=np.float64)
+    V = np.zeros((r, mq), dtype=np.float64)
+    rmses = []
+    for i in range(r):
+        y = mu_tp1[:, i]
+        X = np.concatenate([Phi, -Psi * y[:, None]], axis=1)
+        Y = y
+        R = spec.ridge * np.eye(mp + mq, dtype=np.float64)
+        theta = np.linalg.solve(X.T @ X + R, X.T @ Y)
+        W[i] = theta[:mp]
+        V[i] = theta[mp:]
+        pred = (Phi @ W[i]) / np.maximum(1.0 + (Psi @ V[i]), 1e-6)
+        rmses.append(float(np.sqrt(np.mean((pred - y) ** 2))))
+    f = RationalPadeMap(W=W, V=V, num_basis=num_basis, den_basis=den_basis)
+    return f, float(np.mean(rmses))
+
+@dataclass
+class Orbit:
+    kind: str
+    base: np.ndarray
+    period: int
+    points: List[np.ndarray]
+
+def detect_orbit(f: RationalPadeMap, seeds: np.ndarray,
+                 burnin: int = 40, max_steps: int = 300,
+                 tol_fix: float = 1e-7, tol_cycle: float = 1e-4, pmax: int = 6) -> Optional[Orbit]:
+    for s in seeds:
+        x = s.copy()
+        xs = [x.copy()]
+        for _ in range(max_steps):
+            x = f(x)
+            xs.append(x.copy())
+        for t in range(burnin, max_steps):
+            if np.linalg.norm(xs[t + 1] - xs[t]) < tol_fix:
+                mu_star = xs[t + 1]
+                return Orbit("fixed", mu_star, 1, [mu_star])
+        for t in range(burnin, max_steps):
+            for p in range(2, pmax + 1):
+                if t + p <= max_steps and np.linalg.norm(xs[t + p] - xs[t]) < tol_cycle:
+                    cyc = []
+                    x0 = xs[t].copy()
+                    x = x0.copy()
+                    for _ in range(p):
+                        cyc.append(x.copy())
+                        x = f(x)
+                    return Orbit("cycle", x0, p, cyc)
+    return None
+
+@dataclass
+class FloquetFeatures:
+    spec_radius: float
+    unit_near: float
+    non_normal: float
+    contraction: float
+
+def floquet_features(f: RationalPadeMap, orb: Orbit) -> FloquetFeatures:
+    r = f.W.shape[0]
+    Phi = np.eye(r, dtype=np.float64)
+    if orb.period == 1:
+        Phi = f.jacobian(orb.base)
+    else:
+        for x in orb.points[::-1]:
+            Phi = f.jacobian(x) @ Phi
+    lam = _eigvals(Phi)
+    abs_l = np.abs(lam)
+    spec_radius = float(abs_l.max().real) if abs_l.size > 0 else 0.0
+    unit_near = float(((abs_l > 1.0 - 1e-2) & (abs_l < 1.0 + 1e-2)).sum()) / max(1, abs_l.size)
+    AtA = Phi.T @ Phi
+    AAt = Phi @ Phi.T
+    non_normal = float(np.linalg.norm(AtA - AAt, 'fro') / (np.linalg.norm(Phi, 'fro') ** 2 + 1e-12))
+    contraction = float(np.mean(np.log(np.clip(abs_l, 1e-12, 1e12)))) if abs_l.size > 0 else 0.0
+    return FloquetFeatures(spec_radius=spec_radius, unit_near=unit_near, non_normal=non_normal, contraction=contraction)
+
+def estimate_Q(mu_t: np.ndarray, mu_tp1: np.ndarray, f: RationalPadeMap,
+               shrink: float = 0.2, min_q: float = 1e-6) -> np.ndarray:
+    T, r = mu_t.shape
+    R = np.zeros((T, r), dtype=np.float64)
+    for t in range(T):
+        R[t] = mu_tp1[t] - f(mu_t[t])
+    C = np.cov(R.T) if T > 1 else (R.T @ R) / max(1, T)
+    C = shrink * np.diag(np.diag(C)) + (1.0 - shrink) * C
+    eig = np.linalg.eigvalsh(C)
+    if eig.min() < min_q:
+        C += (min_q - eig.min() + 1e-9) * np.eye(r)
+    return C
+
+def ekf_predict(Sigma: np.ndarray, J: np.ndarray, Q: np.ndarray) -> np.ndarray:
+    return J @ Sigma @ J.T + Q
+
+@dataclass
+class GaloisPolicy:
+    w_res: float = 0.7
+    w_non_normal: float = 0.4
+    w_contract: float = -0.5
+    w_var: float = 0.2
+    dT0_max: float = 0.25
+    dkeep_max: int = 8
+    drag_max: float = 0.5
+
+class SpiralGaloisOnline:
+    def __init__(self, r: int, window: int = 256, period: int = 32,
+                 pade: PadeSpec = PadeSpec(), policy: GaloisPolicy = GaloisPolicy()):
+        self.r = int(r)
+        self.window = int(window)
+        self.period = int(period)
+        self.pade = pade
+        self.policy = policy
+        self.mu_buf: List[np.ndarray] = []
+        self.S_buf: List[np.ndarray] = []
+        self._step = 0
+        self._map: Optional[RationalPadeMap] = None
+        self._Q = np.eye(r) * 1e-3
+        self.hazard_ema = 0.0
+        self.ema = 0.9
+        self.last_meta: Dict[str, Any] = {}
+
+    def observe(self, mu: np.ndarray, Sigma: np.ndarray):
+        self.mu_buf.append(np.asarray(mu, dtype=np.float64).reshape(self.r))
+        self.S_buf.append(np.asarray(Sigma, dtype=np.float64).reshape(self.r, self.r))
+        if len(self.mu_buf) > self.window:
+            self.mu_buf.pop(0)
+            self.S_buf.pop(0)
+        self._step += 1
+
+    def _fit(self) -> Optional[float]:
+        need = min(self.window - 1, max(8, self.r * 2))
+        if len(self.mu_buf) < need:
+            return None
+        mu_seq = np.stack(self.mu_buf, axis=0)
+        mu_t, mu_tp1 = mu_seq[:-1], mu_seq[1:]
+        f, rmse = fit_rational_pade(mu_t, mu_tp1, self.pade)
+        self._map = f
+        self._Q = estimate_Q(mu_t, mu_tp1, f)
+        return rmse
+
+    def suggest(self, knobs: Dict[str, float]) -> Tuple[Dict[str, float], Dict[str, Any]]:
+        rmse = None
+        if self._step % self.period == 0:
+            rmse = self._fit()
+
+        if self._map is None:
+            var_mean = 0.0
+            if self.S_buf:
+                S_last = self.S_buf[-1]
+                var_mean = float(np.trace(S_last) / self.r)
+            warm = 0.2 * np.tanh(var_mean)
+            self.hazard_ema = self.ema * self.hazard_ema + (1.0 - self.ema) * warm
+            hazard = float(self.hazard_ema)
+            pol = self.policy
+            dT0 = float(np.clip(0.20 * hazard, -pol.dT0_max, pol.dT0_max))
+            dkeep = int(np.clip(6.0 * hazard, -pol.dkeep_max, pol.dkeep_max))
+            drag = float(np.clip(0.60 * hazard, 0.0, pol.drag_max))
+            out = dict(knobs)
+            if "T0" in out:
+                out["T0"] = float(np.clip(out["T0"] + dT0, 0.5, 2.0))
+            if "keep_k" in out:
+                out["keep_k"] = max(1, int(out["keep_k"] + dkeep))
+            if "rag_weight" in out:
+                out["rag_weight"] = float(np.clip(out["rag_weight"] * (1.0 - 0.1 * drag), 0.1, 2.0))
+            meta = dict(step=self._step, warmup=True, hazard=hazard, var_mean=var_mean)
+            return out, meta
+
+        mu_seq = np.stack(self.mu_buf, axis=0)
+        seeds_idx = np.linspace(len(mu_seq) // 4, len(mu_seq) - 2, min(8, max(2, len(mu_seq) // 8)), dtype=int)
+        seeds = mu_seq[seeds_idx]
+        orb = detect_orbit(self._map, seeds)
+        if orb is None:
+            m = mu_seq.mean(axis=0)
+            orb = Orbit("fixed", m, 1, [m])
+
+        flo = floquet_features(self._map, orb)
+        mu_last = self.mu_buf[-1]
+        S_last = self.S_buf[-1]
+        J = self._map.jacobian(mu_last)
+        S_pred = ekf_predict(S_last, J, self._Q)
+        var_mean = float(np.trace(S_pred) / self.r)
+
+        pol = self.policy
+        s = 0.0
+        s += pol.w_res * flo.unit_near
+        s += pol.w_non_normal * flo.non_normal
+        s += pol.w_contract * np.tanh(flo.contraction)
+        s += pol.w_var * np.tanh(var_mean)
+        self.hazard_ema = self.ema * self.hazard_ema + (1.0 - self.ema) * s
+        hazard = float(self.hazard_ema)
+
+        dT0 = float(np.clip(0.20 * hazard, -pol.dT0_max, pol.dT0_max))
+        dkeep = int(np.clip(6.0 * hazard, -pol.dkeep_max, pol.dkeep_max))
+        drag = float(np.clip(0.60 * hazard, 0.0, pol.drag_max))
+
+        out = dict(knobs)
+        if "T0" in out:
+            out["T0"] = float(np.clip(out["T0"] + dT0, 0.5, 2.0))
+        if "keep_k" in out:
+            out["keep_k"] = max(1, int(out["keep_k"] + dkeep))
+        if "rag_weight" in out:
+            out["rag_weight"] = float(np.clip(out["rag_weight"] * (1.0 - 0.1 * drag), 0.1, 2.0))
+
+        meta = dict(step=self._step, warmup=False, refit=(rmse is not None), rmse=rmse,
+                    orb_kind=orb.kind, orb_period=orb.period,
+                    spec_radius=flo.spec_radius, unit_near=flo.unit_near,
+                    non_normal=flo.non_normal, contraction=flo.contraction,
+                    var_mean=var_mean, hazard=hazard)
+        self.last_meta = meta
+        self.S_buf[-1] = S_pred
+        return out, meta
+
+# ------------------------------
 # Trainer
 # ------------------------------
 @dataclass
@@ -1896,6 +2436,9 @@ class TrainCfg:
     backprop_T: bool = True; T_grad_scale: float = 0.2
     # logits are tiny by design; multiply for numerically healthy softmax
     logit_gain: float = -1.0  # <=0 enables auto gain based on logit std
+    # galois controller
+    galois_enable: bool = True
+    galois_every: int = 1
     hazard_bandit: HazardBanditCfg = field(default_factory=HazardBanditCfg)
 
 class SpiralV9:
@@ -1903,11 +2446,17 @@ class SpiralV9:
                  seed: int = 0, student_cfg: Optional[StudentCfg] = None, teacher_cfg: Optional[TeacherCfg] = None):
         self.V, self.d, self.H, self.L, self.r = V, d, H, L, r
         self.seed = seed
+        rng = np.random.default_rng(2024 + seed)
         if student_cfg is not None and student_cfg.V != V:
             raise ValueError("StudentCfg.V must match SpiralV9 V to keep vocabulary consistent")
         self.P = make_bigram(V, seed=7 + seed)
         self.teacher_cfg = teacher_cfg or TeacherCfg()
-        self.teacher = SpiralTeacher(V, d, H, L, r, self.P, self.teacher_cfg, seed=42 + seed)
+        Ub = rand_orth(r, 4, rng)
+        Uh = rand_orth(r, 4, rng)
+        Us = rand_orth(r, 4, rng)
+        Lh = np.linspace(0.7, 2.0, Uh.shape[1]).astype(np.float32)
+        kernel = MoralityKernel(Ub, Uh, Us, Lh, KernelCfg())
+        self.teacher = SpiralTeacher(V, d, H, L, r, self.P, self.teacher_cfg, seed=42 + seed, kernel=kernel)
         cfg = student_cfg or StudentCfg(L=max(4, L), d=d, k=max(16, d // 4), V=V, r=r, seed=123 + seed)
         self.student = StudentV9(cfg, self.teacher.B)
         self.logit_gain = float(getattr(self.teacher_cfg, "logit_gain", 1.0))
@@ -1915,6 +2464,7 @@ class SpiralV9:
         self.student_mem_cfg = MemoryCfg(min_sim=0.12, logit_scale=3.0)
         self.student_mem = EpisodicMemory(r=self.r, V=self.V, cfg=self.student_mem_cfg, seed=777 + seed)
         self.tokenizer: Optional[SpiralTokenizer] = None
+        self.galois = SpiralGaloisOnline(r=self.r, window=256, period=128, pade=PadeSpec(p_deg=1, q_deg=1, ridge=2e-4))
 
     # ------------------ persistence + inference ------------------
     def set_tokenizer(self, tokenizer: SpiralTokenizer):
@@ -1971,7 +2521,11 @@ class SpiralV9:
             if hasattr(sms, "item") and not isinstance(sms, dict):
                 sms = sms.item()
             student_mem_state = sms
-        cfg = StudentCfg(**student_state["cfg"])
+        cfg_raw = dict(student_state["cfg"])
+        meta_sleep_raw = cfg_raw.get("meta_sleep")
+        if isinstance(meta_sleep_raw, dict):
+            cfg_raw["meta_sleep"] = MetaSleepCfg(**meta_sleep_raw)
+        cfg = StudentCfg(**cfg_raw)
         V_meta = meta.get("vocab_size", meta.get("V", cfg.V))
         V = V_meta; d = meta.get("d", cfg.d); H = meta.get("H", 4); L = meta.get("L", cfg.L); r = meta.get("r", cfg.r)
         base_seed = meta.get("seed", 0)
@@ -2308,6 +2862,22 @@ class SpiralV9:
 
             # student forward
             s_logits, aux = self.student.forward(ctx, logit_gain=gain_used)
+            galois_keepk = None
+            gmeta = None
+            if cfg.galois_enable and (cfg.galois_every > 0) and ((step + 1) % cfg.galois_every == 0):
+                mu_mean = aux["mu"].mean(axis=0)
+                Sig_mean_diag = aux["Sigma"].mean(axis=0)
+                Sig_mean = np.diag(Sig_mean_diag.astype(np.float64))
+                self.galois.observe(mu_mean, Sig_mean)
+                knobs_now = dict(T0=self.teacher.cfg.T0,
+                                 rag_weight=self.teacher.cfg.rag_w,
+                                 keep_k=int(np.round(self.student._keepk.mean())))
+                knobs_prop, gmeta = self.galois.suggest(knobs_now)
+                self.teacher.cfg.T0 = knobs_prop["T0"]
+                self.teacher.cfg.rag_w = knobs_prop["rag_weight"]
+                galois_keepk = int(knobs_prop["keep_k"])
+                base = np.clip(np.round(0.8 * self.student._keepk + 0.2 * galois_keepk), 2, self.student.cfg.k)
+                self.student.set_keepk_layerwise(base.astype(np.int32))
 
             # --- student_mem wrong-learning (メモリだけ自己修正) ---
             if self.student_mem_cfg.enable and self.student_mem.size > 0:
@@ -2393,6 +2963,8 @@ class SpiralV9:
                 g = float(grad_layers[idx])
                 hazard_grad[l_t] = float(np.clip(g / (2.0 * gref), 0.0, 1.0))
             keepk_new = self.student._keepk.copy()
+            if galois_keepk is not None:
+                keepk_new[:] = int(np.clip(galois_keepk, 2, self.student.cfg.k))
             bandit_actions = bandit_ctrl.select()
             for l in range(self.student.cfg.L):
                 l_t = min(l, self.teacher.L - 1)
@@ -2435,6 +3007,7 @@ class SpiralV9:
             rag_stats = dict(rag_min=float(rag_w.min()), rag_max=float(rag_w.max()), rag_mean=float(rag_w.mean()))
             ece = expected_calibration_error(p_s, y, n_bins=15)
             brier = brier_score(p_s, y)
+            self.teacher.set_ece(ece)
             dbg_nll = dbg_acc = dbg_uniform = dbg_oracle = None
             if cfg.debug_nll_every > 0 and ((step + 1) % cfg.debug_nll_every == 0):
                 p1 = softmax_rows(s_logits)  # fixed T=1.0 view of student
@@ -2470,6 +3043,7 @@ class SpiralV9:
                              embed_dnorm=embed_delta, embed_gnorm=embed_gnorm,
                              ce_scale=ce_scale, kl_scale=kl_scale, distil_phase=distil_phase,
                              dbg_nll=dbg_nll, dbg_acc=dbg_acc, dbg_uniform=dbg_uniform, dbg_oracle=dbg_oracle,
+                             galois_meta=(gmeta if gmeta is not None else {}),
                              **rag_stats)
             if train_tokens is not None and ((step + 1) % cfg.eval_every == 0 or (step + 1) == cfg.steps):
                 eval_train = self._eval_split(eval_train_ctx, eval_train_y, cfg.batch) if eval_train_ctx is not None else None
@@ -2527,6 +3101,7 @@ def demo(args=None):
     p.add_argument("--seed", type=int, default=0, help="base seed for synthetic data/initialization")
     p.add_argument("--data_path", type=str, default=None, help="optional npy file with token ids")
     p.add_argument("--text_path", type=str, default=None, help="optional utf-8 text file to train tokenizer + dataset")
+    p.add_argument("--text_paths", nargs="*", default=None, help="optional list/glob of utf-8 text files for tokenizer + dataset")
     p.add_argument("--tok_vocab", type=int, default=256, help="tokenizer vocab size target when using text_path")
     p.add_argument("--tok_min_freq", type=int, default=2, help="minimum pair frequency for BPE merges")
     p.add_argument("--tok_word_topk", type=int, default=256, help="top-N full-word atoms to seed the tokenizer")
@@ -2580,8 +3155,13 @@ def demo(args=None):
     p.add_argument("--bandit_penalty", type=float, default=1.0, help="penalty when risky mode spikes")
     p.add_argument("--bandit_grad_thr", type=float, default=1.5, help="relative grad threshold before counting a spike")
     p.add_argument("--bandit_reward_scale", type=float, default=1.0, help="scale ΔCE reward before feeding bandit")
+    p.add_argument("--galois_disable", action="store_true", help="disable galois online knob controller")
+    p.add_argument("--galois_every", type=int, default=1, help="galois update cadence (steps)")
+    p.add_argument("--strict_matmul", action="store_true", help="disable safe_matmul sanitization for debugging")
     parsed = p.parse_args(args=args)
 
+    global STRICT_MATMUL
+    STRICT_MATMUL = bool(parsed.strict_matmul)
     data_tokens = None
     vocab_override = parsed.V
     tokenizer: Optional[SpiralTokenizer] = None
@@ -2592,9 +3172,30 @@ def demo(args=None):
         vocab_override = max(vocab_override, data_vmax)
         data_tokens = np.clip(data_tokens, 0, vocab_override - 1)
         print(f"[data] Loaded tokens from {parsed.data_path} (N={data_tokens.size}, vmax={data_vmax})")
-    if parsed.text_path and data_tokens is None:
-        with open(parsed.text_path, "r", encoding="utf-8") as f:
-            text = f.read()
+    def _expand_paths(paths: List[str]) -> List[str]:
+        out: List[str] = []
+        for pth in paths:
+            matches = glob.glob(pth)
+            if matches:
+                out.extend(matches)
+            else:
+                out.append(pth)
+        return out
+
+    if (parsed.text_path or parsed.text_paths) and data_tokens is None:
+        text_paths: List[str] = []
+        if parsed.text_path:
+            text_paths.extend([p.strip() for p in parsed.text_path.split(",") if p.strip()])
+        if parsed.text_paths:
+            text_paths.extend(parsed.text_paths)
+        text_paths = _expand_paths(text_paths)
+        if not text_paths:
+            raise ValueError("No text files found for --text_path/--text_paths")
+        chunks = []
+        for path in text_paths:
+            with open(path, "r", encoding="utf-8") as f:
+                chunks.append(f.read())
+        text = "\n".join(chunks)
         tok_cfg = TokenizerCfg(vocab_size=parsed.tok_vocab, min_freq=parsed.tok_min_freq,
                                word_topk=parsed.tok_word_topk, word_min_freq=parsed.tok_word_min_freq,
                                add_bos=not parsed.tok_no_bos, add_eos=not parsed.tok_no_eos,
@@ -2604,7 +3205,8 @@ def demo(args=None):
         data_tokens = tokenizer.encode_corpus(text)
         vocab_override = tokenizer.vocab_size
         data_tokens = np.clip(data_tokens, 0, vocab_override - 1)
-        print(f"[tokenizer] Trained tokenizer (vocab={tokenizer.vocab_size}) from {parsed.text_path}; corpus tokens={data_tokens.size}")
+        src = ", ".join(text_paths)
+        print(f"[tokenizer] Trained tokenizer (vocab={tokenizer.vocab_size}) from {src}; corpus tokens={data_tokens.size}")
     if tokenizer is not None:
         vocab_override = max(vocab_override, tokenizer.vocab_size)
 
@@ -2653,6 +3255,7 @@ def demo(args=None):
                        lr_k_stab=0.02, lr_k_expl=0.01,
                        keepk_boost=1, rho_boost=0.0, backprop_T=True, T_grad_scale=0.1,
                        data_path=parsed.data_path, logit_gain=parsed.logit_gain,
+                       galois_enable=not parsed.galois_disable, galois_every=parsed.galois_every,
                        hazard_bandit=bandit_cfg)
         logs = eng.train(cfg, data_tokens=data_tokens)
         if logs and parsed.log_path:
