@@ -2694,9 +2694,10 @@ def load_checkpoint(ckpt_path: str, allow_pickle: bool = True) -> Dict[str, Any]
         raise ValueError("Checkpoint did not contain a dict payload")
     return blob
 
-def apply_checkpoint(eng: SpiralV9, ckpt: Dict[str, Any]) -> Tuple[int, Optional[Dict[str, Any]]]:
+def apply_checkpoint(eng: SpiralV9, ckpt: Dict[str, Any], restore_strict: bool = False) -> Tuple[int, Optional[Dict[str, Any]]]:
     global STRICT_MATMUL
-    STRICT_MATMUL = bool(ckpt.get("engine", {}).get("STRICT_MATMUL", STRICT_MATMUL))
+    if restore_strict:
+        STRICT_MATMUL = bool(ckpt.get("engine", {}).get("STRICT_MATMUL", STRICT_MATMUL))
     eng.logit_gain = float(ckpt.get("engine", {}).get("logit_gain", eng.logit_gain))
     eng.student.load_state(ckpt["student_state"])
     eng.teacher.load_state(ckpt["teacher_state"])
@@ -3348,6 +3349,7 @@ def demo(args=None):
     p.add_argument("--save_every", type=int, default=0, help="checkpoint save interval (steps)")
     p.add_argument("--resume", action="store_true", help="resume from latest checkpoint in ckpt_dir")
     p.add_argument("--keep_last", type=int, default=3, help="how many checkpoints to keep")
+    p.add_argument("--resume_strict_matmul", action="store_true", help="restore STRICT_MATMUL from checkpoint")
     parsed = p.parse_args(args=args)
 
     global STRICT_MATMUL
@@ -3416,7 +3418,7 @@ def demo(args=None):
         ckpts = sorted(glob.glob(ckpt_glob))
         if ckpts:
             ckpt = load_checkpoint(ckpts[-1], allow_pickle=True)
-            start_step, rng_state = apply_checkpoint(eng, ckpt)
+            start_step, rng_state = apply_checkpoint(eng, ckpt, restore_strict=parsed.resume_strict_matmul)
             print(f"[ckpt] Resumed from {ckpts[-1]} at step {start_step}")
 
     if parsed.override_rag:
