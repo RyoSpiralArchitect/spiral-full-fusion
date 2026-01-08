@@ -34,6 +34,7 @@ You’ll get a brisk training run that paints the loop: generate → reliability
 - **Hazard bandit**: flip `--hazard_bandit` to let a per-layer two-armed bandit pick safe vs. risky modes (keep_k / LR deltas) with survival bonuses and spike penalties. Adjust deltas and thresholds via the `--bandit_*` flags.
 - **Galois controller**: enable Padé/Floquet hazard control for `T0`/`rag_weight`/`keep_k` updates; use `--galois_disable` to turn it off or `--galois_every` to tune cadence.
 - **Strict matmul debugging**: use `--strict_matmul` to disable NaN/Inf scrubbing in `safe_matmul` and surface numerical issues.
+- **Checkpointing**: use `--ckpt_dir` with `--save_every` to auto-save training snapshots, `--resume` to load the latest, and `--keep_last` to prune older checkpoints.
 - **Meta-Sleep attention**: the rank-k attention layers now track meta statistics of keys (EMA mean/var + Oja PCA) and can slowly integrate “sleep” memories with whitening and shrinkage. Enable with `StudentCfg.meta_sleep.enable` in code to experiment with delayed consolidation.
 
 ## Usage samples
@@ -85,6 +86,12 @@ Inject hazard-bandit exploration into training:
 python SpiralFullFusion_toy.py --steps 200 --batch 16 --ctx_len 8 \
   --hazard_bandit --bandit_keepk_risky 3 --bandit_rho_risky -0.3 \
   --save_path /tmp/spiral_bandit.npz
+```
+
+Checkpoint every 50 steps and resume:
+```bash
+python SpiralFullFusion_toy.py --steps 400 --ckpt_dir ./ckpt --save_every 50
+python SpiralFullFusion_toy.py --steps 400 --ckpt_dir ./ckpt --resume
 ```
 
 ### Toy-friendly defaults
