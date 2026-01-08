@@ -11,6 +11,7 @@ import re
 import importlib.util
 
 EPS = 1e-8
+STRICT_MATMUL = False
 
 # ------------------------------
 # utils
@@ -30,6 +31,8 @@ def safe_tanh(x: np.ndarray) -> np.ndarray:
     return np.tanh(np.clip(x, -10.0, 10.0)).astype(np.float32)
 
 def safe_matmul(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    if STRICT_MATMUL:
+        return (a @ b).astype(np.float32)
     a_clean = np.nan_to_num(a, nan=0.0, posinf=1e3, neginf=-1e3).astype(np.float32)
     b_clean = np.nan_to_num(b, nan=0.0, posinf=1e3, neginf=-1e3).astype(np.float32)
     with np.errstate(invalid='ignore', over='ignore', divide='ignore'):
@@ -1637,14 +1640,17 @@ class RankParamHead:
         # h_last: [B,T,d] → use last token state
         last = h_last[:, -1, :]
         mu = self.mean.forward(last)                       # [B,r]
-        lt = np.clip(self.logtau.forward(last), -6.0, 6.0) # [B,r]
+        lt_raw = self.logtau.forward(last)
+        lt = np.clip(lt_raw, -6.0, 6.0)                    # [B,r]
         tau = np.exp(lt) + 1e-6
-        self._last = dict(last=last, lt=lt, tau=tau)
+        clip_mask = (lt_raw == lt).astype(np.float32)
+        self._last = dict(last=last, lt=lt, tau=tau, clip_mask=clip_mask)
         return mu.astype(np.float32), tau.astype(np.float32)
     def backward(self, dmu: np.ndarray, dtau: np.ndarray) -> np.ndarray:
         # dmu, dtau: [B,r]
         # propagate to last-token features
-        dlast = self.mean.backward(dmu) + self.logtau.backward(dtau * np.exp(self._last["lt"]))
+        dlt = dtau * np.exp(self._last["lt"]) * self._last["clip_mask"]
+        dlast = self.mean.backward(dmu) + self.logtau.backward(dlt)
         B, d = dlast.shape
         dh = np.zeros((B, 1, d), dtype=np.float32)
         dh[:, -1, :] = dlast
@@ -3133,8 +3139,11 @@ def demo(args=None):
     p.add_argument("--bandit_reward_scale", type=float, default=1.0, help="scale ΔCE reward before feeding bandit")
     p.add_argument("--galois_disable", action="store_true", help="disable galois online knob controller")
     p.add_argument("--galois_every", type=int, default=1, help="galois update cadence (steps)")
+    p.add_argument("--strict_matmul", action="store_true", help="disable safe_matmul sanitization for debugging")
     parsed = p.parse_args(args=args)
 
+    global STRICT_MATMUL
+    STRICT_MATMUL = bool(parsed.strict_matmul)
     data_tokens = None
     vocab_override = parsed.V
     tokenizer: Optional[SpiralTokenizer] = None
