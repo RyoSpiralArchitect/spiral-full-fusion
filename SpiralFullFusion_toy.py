@@ -573,7 +573,7 @@ def sample_batch_bigram(P: np.ndarray, ctx_len: int, B: int, rng: np.random.Gene
         prev = tokens[:, t - 1]
         u = rng.random((B,))
         cdf = np.cumsum(P[prev], axis=1)
-        tokens[:, t] = (u[:, None] > cdf).sum(axis=1)
+        tokens[:, t] = np.minimum((u[:, None] > cdf).sum(axis=1), V - 1)
     ctx = tokens[:, :ctx_len].copy()
     y = tokens[:, ctx_len].copy()
     return ctx, y
@@ -859,7 +859,7 @@ class MemoryCfg:
     store_m: int = 8             # store top-m tokens per entry
     retrieve_k: int = 16         # retrieve top-k nearest entries
     sim_temp: float = 0.07       # softmax temperature for neighbor weighting
-    min_sim: float = 0.20        # if best similarity < min_sim -> don't use memory
+    min_sim: float = 0.12        # if best similarity < min_sim -> don't use memory
     logit_scale: float = 1.5     # how strongly memory distribution boosts logits
     decay: float = 0.9995        # global strength decay per teacher.forward_batch call
     touch_alpha: float = 0.025   # strengthen retrieved entries
@@ -873,7 +873,7 @@ class MemoryCfg:
 
     # insertion gating (only during training when targets are available)
     add_rate: float = 0.50       # subsample insertions (0..1)
-    add_prob_thr: float = 0.35   # insert only if teacher prob(y) >= thr
+    add_prob_thr: float = 0.10   # insert only if teacher prob(y) >= thr
     add_T_thr: float = 1.20      # and teacher temperature <= thr
     min_store_prob: float = 0.02 # if target not in top-m, force-insert with at least this prob
 
@@ -1708,7 +1708,11 @@ class StudentV9:
         )
 
     def load_state(self, state: Dict[str, Any]):
-        self.cfg = StudentCfg(**state["cfg"])
+        cfg_raw = dict(state["cfg"])
+        meta_sleep_raw = cfg_raw.get("meta_sleep")
+        if isinstance(meta_sleep_raw, dict):
+            cfg_raw["meta_sleep"] = MetaSleepCfg(**meta_sleep_raw)
+        self.cfg = StudentCfg(**cfg_raw)
         self.B = state["B"].astype(np.float32)
         self._keepk = state["keepk"].astype(np.int32)
         self.u.rho = state["rho"].astype(np.float32)
@@ -2436,7 +2440,7 @@ class SpiralV9:
         self.student_mem_cfg = MemoryCfg(min_sim=0.12, logit_scale=3.0)
         self.student_mem = EpisodicMemory(r=self.r, V=self.V, cfg=self.student_mem_cfg, seed=777 + seed)
         self.tokenizer: Optional[SpiralTokenizer] = None
-        self.galois = SpiralGaloisOnline(r=self.r, window=256, period=32, pade=PadeSpec(p_deg=2, q_deg=1, ridge=2e-4))
+        self.galois = SpiralGaloisOnline(r=self.r, window=256, period=128, pade=PadeSpec(p_deg=1, q_deg=1, ridge=2e-4))
 
     # ------------------ persistence + inference ------------------
     def set_tokenizer(self, tokenizer: SpiralTokenizer):
