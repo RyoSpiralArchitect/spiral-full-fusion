@@ -4,6 +4,7 @@
 # NumPy-only, single-file demo. Safe initializations and eps clamps to avoid NaNs.
 from dataclasses import dataclass, asdict, field
 from typing import List, Tuple, Optional, Dict, Any
+import glob
 import math
 import numpy as np
 import re
@@ -37,7 +38,7 @@ def safe_matmul(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     return y
 
 
-def apply_logit_gain(logits: np.ndarray, gain: float, target_std: float = 1.5, max_scale: float = 20000.0) -> Tuple[np.ndarray, float]:
+def apply_logit_gain(logits: np.ndarray, gain: float, target_std: float = 1.5, max_scale: float = 1000.0) -> Tuple[np.ndarray, float]:
     """
     Rescale logits to avoid near-uniform outputs.
       - gain > 0: use directly (clamped to max_scale)
@@ -1192,9 +1193,17 @@ class SpiralTeacher:
                     rel = float(np.mean(taus[h]))
                     self.rel.update(l, h, dom, rel)
 
-            # posterior across layers (simple chain)
-            mu_post, var_post = mu_l[-1], var_l[-1]
-            # state regularization could be added here
+            # posterior across layers (precision fusion with reliability weighting)
+            tau_sum = np.zeros((self.r,), dtype=np.float32) + 1e-6
+            mu_num = np.zeros((self.r,), dtype=np.float32)
+            for l in range(self.L):
+                tau_l = 1.0 / np.maximum(var_l[l], 1e-6)
+                rel_l = float(np.clip(np.mean(self.rel.y[l]), 0.1, 10.0))
+                tau_w = tau_l * rel_l
+                tau_sum += tau_w
+                mu_num += tau_w * mu_l[l]
+            mu_post = mu_num / tau_sum
+            var_post = 1.0 / tau_sum
 
             # logits before RAG
             logits_b = self.fusers[-1].logits_from_mu(mu_post)
@@ -1347,7 +1356,7 @@ class SpiralTeacher:
         kernel_rag_norm = float(np.mean(kernel_norms)) if kernel_norms else 0.0
 
         gain = float(self.cfg.logit_gain if logit_gain is None else logit_gain)
-        logits, gain_used = apply_logit_gain(logits, gain, target_std=1.5, max_scale=20000.0)
+        logits, gain_used = apply_logit_gain(logits, gain, target_std=1.5, max_scale=1000.0)
 
         meta = dict(
             meanVar=float(meanVars.mean()),
@@ -1559,7 +1568,9 @@ class RankKAttention:
             proj = np.tensordot(kfull.reshape(-1, self.kdim), u, axes=1)
             du = lr * (kfull.reshape(-1, self.kdim).T @ (proj)) / max(1, kfull.size // self.kdim)
             u = u + du
-            u = u - np.sum(self.meta_U[:, :r] * u[:, None], axis=1)
+            if r > 0:
+                proj = self.meta_U[:, :r].T @ u
+                u = u - self.meta_U[:, :r] @ proj
             self.meta_U[:, r] = u / max(1e-6, np.linalg.norm(u))
 
     def _meta_proj(self, keep_k: int) -> np.ndarray:
@@ -1736,7 +1747,7 @@ class StudentV9:
         mu, tau = self.rank_head.forward(h)  # [B,r], [B,r]
         logits = safe_matmul(mu, self.B)     # [B,V]
         Sigma = 1.0 / np.maximum(tau, 1e-6)  # [B,r]
-        logits, gain_used = apply_logit_gain(logits, logit_gain, target_std=1.5, max_scale=20000.0)
+        logits, gain_used = apply_logit_gain(logits, logit_gain, target_std=1.5, max_scale=1000.0)
         return logits, dict(h=h, mu=mu, tau=tau, Sigma=Sigma, attn=attn_maps, logit_gain_used=float(gain_used))
 
     def backward(self, dlogits: np.ndarray, aux: Dict[str, Any], dSigma_from_T: Optional[np.ndarray] = None):
@@ -2298,7 +2309,8 @@ class SpiralGaloisOnline:
         self._step += 1
 
     def _fit(self) -> Optional[float]:
-        if len(self.mu_buf) < max(8, self.r * 8):
+        need = min(self.window - 1, max(8, self.r * 4))
+        if len(self.mu_buf) < need:
             return None
         mu_seq = np.stack(self.mu_buf, axis=0)
         mu_t, mu_tp1 = mu_seq[:-1], mu_seq[1:]
@@ -2481,7 +2493,11 @@ class SpiralV9:
             if hasattr(sms, "item") and not isinstance(sms, dict):
                 sms = sms.item()
             student_mem_state = sms
-        cfg = StudentCfg(**student_state["cfg"])
+        cfg_raw = dict(student_state["cfg"])
+        meta_sleep_raw = cfg_raw.get("meta_sleep")
+        if isinstance(meta_sleep_raw, dict):
+            cfg_raw["meta_sleep"] = MetaSleepCfg(**meta_sleep_raw)
+        cfg = StudentCfg(**cfg_raw)
         V_meta = meta.get("vocab_size", meta.get("V", cfg.V))
         V = V_meta; d = meta.get("d", cfg.d); H = meta.get("H", 4); L = meta.get("L", cfg.L); r = meta.get("r", cfg.r)
         base_seed = meta.get("seed", 0)
@@ -3057,6 +3073,7 @@ def demo(args=None):
     p.add_argument("--seed", type=int, default=0, help="base seed for synthetic data/initialization")
     p.add_argument("--data_path", type=str, default=None, help="optional npy file with token ids")
     p.add_argument("--text_path", type=str, default=None, help="optional utf-8 text file to train tokenizer + dataset")
+    p.add_argument("--text_paths", nargs="*", default=None, help="optional list/glob of utf-8 text files for tokenizer + dataset")
     p.add_argument("--tok_vocab", type=int, default=256, help="tokenizer vocab size target when using text_path")
     p.add_argument("--tok_min_freq", type=int, default=2, help="minimum pair frequency for BPE merges")
     p.add_argument("--tok_word_topk", type=int, default=256, help="top-N full-word atoms to seed the tokenizer")
@@ -3124,9 +3141,30 @@ def demo(args=None):
         vocab_override = max(vocab_override, data_vmax)
         data_tokens = np.clip(data_tokens, 0, vocab_override - 1)
         print(f"[data] Loaded tokens from {parsed.data_path} (N={data_tokens.size}, vmax={data_vmax})")
-    if parsed.text_path and data_tokens is None:
-        with open(parsed.text_path, "r", encoding="utf-8") as f:
-            text = f.read()
+    def _expand_paths(paths: List[str]) -> List[str]:
+        out: List[str] = []
+        for pth in paths:
+            matches = glob.glob(pth)
+            if matches:
+                out.extend(matches)
+            else:
+                out.append(pth)
+        return out
+
+    if (parsed.text_path or parsed.text_paths) and data_tokens is None:
+        text_paths: List[str] = []
+        if parsed.text_path:
+            text_paths.extend([p.strip() for p in parsed.text_path.split(",") if p.strip()])
+        if parsed.text_paths:
+            text_paths.extend(parsed.text_paths)
+        text_paths = _expand_paths(text_paths)
+        if not text_paths:
+            raise ValueError("No text files found for --text_path/--text_paths")
+        chunks = []
+        for path in text_paths:
+            with open(path, "r", encoding="utf-8") as f:
+                chunks.append(f.read())
+        text = "\n".join(chunks)
         tok_cfg = TokenizerCfg(vocab_size=parsed.tok_vocab, min_freq=parsed.tok_min_freq,
                                word_topk=parsed.tok_word_topk, word_min_freq=parsed.tok_word_min_freq,
                                add_bos=not parsed.tok_no_bos, add_eos=not parsed.tok_no_eos,
@@ -3136,7 +3174,8 @@ def demo(args=None):
         data_tokens = tokenizer.encode_corpus(text)
         vocab_override = tokenizer.vocab_size
         data_tokens = np.clip(data_tokens, 0, vocab_override - 1)
-        print(f"[tokenizer] Trained tokenizer (vocab={tokenizer.vocab_size}) from {parsed.text_path}; corpus tokens={data_tokens.size}")
+        src = ", ".join(text_paths)
+        print(f"[tokenizer] Trained tokenizer (vocab={tokenizer.vocab_size}) from {src}; corpus tokens={data_tokens.size}")
     if tokenizer is not None:
         vocab_override = max(vocab_override, tokenizer.vocab_size)
 
