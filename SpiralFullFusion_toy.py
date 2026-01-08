@@ -2623,7 +2623,6 @@ def apply_checkpoint(eng: SpiralV9, ckpt: Dict[str, Any]) -> Tuple[int, Optional
             eng.teacher.load_state(teacher_state)
             eng.teacher_cfg = eng.teacher.cfg
             eng.logit_gain = float(getattr(eng.teacher_cfg, "logit_gain", eng.logit_gain))
-        # restore student episodic memory (keys=student mu)
         if student_mem_cfg_state is not None:
             eng.student_mem_cfg = MemoryCfg(**student_mem_cfg_state)
         else:
@@ -2633,11 +2632,9 @@ def apply_checkpoint(eng: SpiralV9, ckpt: Dict[str, Any]) -> Tuple[int, Optional
             eng.student_mem.load_state(student_mem_state)
         if eng.student.cfg.V != eng.V:
             raise ValueError(f"Loaded student vocab ({eng.student.cfg.V}) does not match engine V ({eng.V})")
-        # assert shapes before sharing projection
         assert eng.student.B.shape == eng.teacher.fusers[0].B.shape, "B shape mismatch"
         assert eng.student.cfg.r == eng.student.B.shape[0], "student r mismatch"
         assert eng.V == eng.student.B.shape[1], "V mismatch"
-        # align teacher logits with loaded student projection (B is shared)
         eng.teacher.B = eng.student.B
         for f in eng.teacher.fusers:
             f.B = eng.student.B
@@ -2650,6 +2647,91 @@ def apply_checkpoint(eng: SpiralV9, ckpt: Dict[str, Any]) -> Tuple[int, Optional
             if eng.tokenizer.vocab_size != eng.V:
                 raise ValueError(f"Tokenizer vocab ({eng.tokenizer.vocab_size}) does not match model V ({eng.V}); ensure saved vocab is reused.")
         return eng
+
+def save_checkpoint(ckpt_path: str, eng: SpiralV9, step: int, np_rng_state: Optional[Dict[str, Any]] = None):
+    galois = eng.galois
+    mu_buf = np.stack(galois.mu_buf, axis=0).astype(np.float64) if len(galois.mu_buf) > 0 else np.zeros((0, eng.r), dtype=np.float64)
+    S_buf = np.stack(galois.S_buf, axis=0).astype(np.float64) if len(galois.S_buf) > 0 else np.zeros((0, eng.r, eng.r), dtype=np.float64)
+    galois_state = dict(
+        mu_buf=mu_buf,
+        S_buf=S_buf,
+        _step=int(galois._step),
+        hazard_ema=float(galois.hazard_ema),
+        _Q=galois._Q.copy(),
+        has_map=(galois._map is not None),
+        map_W=(galois._map.W.copy() if galois._map is not None else None),
+        map_V=(galois._map.V.copy() if galois._map is not None else None),
+        pade=asdict(galois.pade),
+        policy=asdict(galois.policy),
+        window=int(galois.window),
+        period=int(galois.period),
+        ema=float(galois.ema),
+    )
+    state = dict(
+        step=int(step),
+        np_rng_state=np_rng_state,
+        engine=dict(
+            V=eng.V, d=eng.d, H=eng.H, L=eng.L, r=eng.r, seed=eng.seed,
+            logit_gain=float(eng.logit_gain),
+            STRICT_MATMUL=bool(STRICT_MATMUL),
+        ),
+        student_state=eng.student.state_dict(),
+        teacher_state=eng.teacher.state_dict(),
+        teacher_cfg=asdict(eng.teacher.cfg),
+        student_mem_cfg=asdict(eng.student_mem_cfg),
+        student_mem_state=eng.student_mem.state_dict(),
+        galois=galois_state,
+        tokenizer_state=(eng.tokenizer.state_dict() if eng.tokenizer is not None else None),
+    )
+    np.savez_compressed(ckpt_path, blob=np.array([state], dtype=object))
+
+def load_checkpoint(ckpt_path: str, allow_pickle: bool = True) -> Dict[str, Any]:
+    data = np.load(ckpt_path, allow_pickle=allow_pickle)
+    blob = data["blob"][0] if "blob" in data else data
+    if hasattr(blob, "item") and not isinstance(blob, dict):
+        blob = blob.item()
+    if not isinstance(blob, dict):
+        raise ValueError("Checkpoint did not contain a dict payload")
+    return blob
+
+def apply_checkpoint(eng: SpiralV9, ckpt: Dict[str, Any]) -> Tuple[int, Optional[Dict[str, Any]]]:
+    global STRICT_MATMUL
+    STRICT_MATMUL = bool(ckpt.get("engine", {}).get("STRICT_MATMUL", STRICT_MATMUL))
+    eng.logit_gain = float(ckpt.get("engine", {}).get("logit_gain", eng.logit_gain))
+    eng.student.load_state(ckpt["student_state"])
+    eng.teacher.load_state(ckpt["teacher_state"])
+    eng.teacher.cfg = TeacherCfg(**ckpt.get("teacher_cfg", asdict(eng.teacher.cfg)))
+    eng.student_mem_cfg = MemoryCfg(**ckpt.get("student_mem_cfg", asdict(eng.student_mem_cfg)))
+    eng.student_mem = EpisodicMemory(r=eng.r, V=eng.V, cfg=eng.student_mem_cfg, seed=777 + eng.seed)
+    eng.student_mem.load_state(ckpt.get("student_mem_state"))
+    tok_state = ckpt.get("tokenizer_state")
+    if tok_state is not None:
+        tok = SpiralTokenizer.from_state(tok_state)
+        if tok.vocab_size != eng.V:
+            raise ValueError(f"Tokenizer vocab {tok.vocab_size} != engine V {eng.V}")
+        eng.tokenizer = tok
+    g = ckpt.get("galois")
+    if g is not None:
+        mu_arr = np.array(g.get("mu_buf", []), dtype=np.float64)
+        S_arr = np.array(g.get("S_buf", []), dtype=np.float64)
+        eng.galois.mu_buf = [x for x in mu_arr] if mu_arr.ndim == 2 and mu_arr.size else []
+        eng.galois.S_buf = [x for x in S_arr] if S_arr.ndim == 3 and S_arr.size else []
+        eng.galois._step = int(g.get("_step", 0))
+        eng.galois.hazard_ema = float(g.get("hazard_ema", 0.0))
+        eng.galois._Q = np.array(g.get("_Q", np.eye(eng.r) * 1e-3), dtype=np.float64)
+        eng.galois.pade = PadeSpec(**g.get("pade", asdict(eng.galois.pade)))
+        eng.galois.policy = GaloisPolicy(**g.get("policy", asdict(eng.galois.policy)))
+        eng.galois.window = int(g.get("window", eng.galois.window))
+        eng.galois.period = int(g.get("period", eng.galois.period))
+        eng.galois.ema = float(g.get("ema", eng.galois.ema))
+        if g.get("has_map", False):
+            num_basis = build_poly_basis(eng.r, PolySpec(deg=eng.galois.pade.p_deg, include_const=True), for_den=False)
+            den_basis = build_poly_basis(eng.r, PolySpec(deg=eng.galois.pade.q_deg, include_const=False), for_den=True)
+            eng.galois._map = RationalPadeMap(W=np.array(g.get("map_W")), V=np.array(g.get("map_V")),
+                                              num_basis=num_basis, den_basis=den_basis)
+    step = int(ckpt.get("step", 0))
+    np_state = ckpt.get("np_rng_state")
+    return step, np_state
 
     def generate(self, prompt_ids: np.ndarray, max_new_tokens: int = 32,
                  temperature: float = 1.0, top_p: float = 0.9, top_k: Optional[int] = None,
@@ -3333,7 +3415,7 @@ def demo(args=None):
         ckpt_glob = os.path.join(parsed.ckpt_dir, "ckpt_step_*.npz")
         ckpts = sorted(glob.glob(ckpt_glob))
         if ckpts:
-            ckpt = load_checkpoint(ckpts[-1], allow_pickle=parsed.allow_pickle_load)
+            ckpt = load_checkpoint(ckpts[-1], allow_pickle=True)
             start_step, rng_state = apply_checkpoint(eng, ckpt)
             print(f"[ckpt] Resumed from {ckpts[-1]} at step {start_step}")
 
