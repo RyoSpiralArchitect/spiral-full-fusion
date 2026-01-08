@@ -2319,7 +2319,7 @@ class SpiralGaloisOnline:
         self._step += 1
 
     def _fit(self) -> Optional[float]:
-        need = min(self.window - 1, max(8, self.r * 4))
+        need = min(self.window - 1, max(8, self.r * 2))
         if len(self.mu_buf) < need:
             return None
         mu_seq = np.stack(self.mu_buf, axis=0)
@@ -2335,8 +2335,26 @@ class SpiralGaloisOnline:
             rmse = self._fit()
 
         if self._map is None:
-            meta = dict(step=self._step, warmup=True, hazard=self.hazard_ema)
-            return dict(knobs), meta
+            var_mean = 0.0
+            if self.S_buf:
+                S_last = self.S_buf[-1]
+                var_mean = float(np.trace(S_last) / self.r)
+            warm = 0.2 * np.tanh(var_mean)
+            self.hazard_ema = self.ema * self.hazard_ema + (1.0 - self.ema) * warm
+            hazard = float(self.hazard_ema)
+            pol = self.policy
+            dT0 = float(np.clip(0.20 * hazard, -pol.dT0_max, pol.dT0_max))
+            dkeep = int(np.clip(6.0 * hazard, -pol.dkeep_max, pol.dkeep_max))
+            drag = float(np.clip(0.60 * hazard, 0.0, pol.drag_max))
+            out = dict(knobs)
+            if "T0" in out:
+                out["T0"] = float(np.clip(out["T0"] + dT0, 0.5, 2.0))
+            if "keep_k" in out:
+                out["keep_k"] = max(1, int(out["keep_k"] + dkeep))
+            if "rag_weight" in out:
+                out["rag_weight"] = float(np.clip(out["rag_weight"] * (1.0 - 0.1 * drag), 0.1, 2.0))
+            meta = dict(step=self._step, warmup=True, hazard=hazard, var_mean=var_mean)
+            return out, meta
 
         mu_seq = np.stack(self.mu_buf, axis=0)
         seeds_idx = np.linspace(len(mu_seq) // 4, len(mu_seq) - 2, min(8, max(2, len(mu_seq) // 8)), dtype=int)
