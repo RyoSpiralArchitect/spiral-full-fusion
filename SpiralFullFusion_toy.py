@@ -2489,6 +2489,87 @@ class SpiralV9:
             state["tokenizer_state"] = self.tokenizer.state_dict()
         np.savez_compressed(path, **{k: np.array([v], dtype=object) for k, v in state.items()})
 
+def save_checkpoint(ckpt_path: str, eng: SpiralV9, step: int, np_rng_state: Optional[Dict[str, Any]] = None):
+    galois = eng.galois
+    galois_state = dict(
+        mu_buf=np.array(galois.mu_buf, dtype=np.float64),
+        S_buf=np.array(galois.S_buf, dtype=np.float64),
+        _step=int(galois._step),
+        hazard_ema=float(galois.hazard_ema),
+        _Q=galois._Q.copy(),
+        has_map=(galois._map is not None),
+        map_W=(galois._map.W.copy() if galois._map is not None else None),
+        map_V=(galois._map.V.copy() if galois._map is not None else None),
+        pade=asdict(galois.pade),
+        policy=asdict(galois.policy),
+        window=int(galois.window),
+        period=int(galois.period),
+        ema=float(galois.ema),
+    )
+    state = dict(
+        step=int(step),
+        np_rng_state=np_rng_state,
+        engine=dict(
+            V=eng.V, d=eng.d, H=eng.H, L=eng.L, r=eng.r, seed=eng.seed,
+            logit_gain=float(eng.logit_gain),
+            STRICT_MATMUL=bool(STRICT_MATMUL),
+        ),
+        student_state=eng.student.state_dict(),
+        teacher_state=eng.teacher.state_dict(),
+        teacher_cfg=asdict(eng.teacher.cfg),
+        student_mem_cfg=asdict(eng.student_mem_cfg),
+        student_mem_state=eng.student_mem.state_dict(),
+        galois=galois_state,
+        tokenizer_state=(eng.tokenizer.state_dict() if eng.tokenizer is not None else None),
+    )
+    np.savez_compressed(ckpt_path, blob=np.array([state], dtype=object))
+
+def load_checkpoint(ckpt_path: str, allow_pickle: bool = False) -> Dict[str, Any]:
+    data = np.load(ckpt_path, allow_pickle=allow_pickle)
+    blob = data["blob"][0] if "blob" in data else data
+    if hasattr(blob, "item") and not isinstance(blob, dict):
+        blob = blob.item()
+    if not isinstance(blob, dict):
+        raise ValueError("Checkpoint did not contain a dict payload")
+    return blob
+
+def apply_checkpoint(eng: SpiralV9, ckpt: Dict[str, Any]) -> Tuple[int, Optional[Dict[str, Any]]]:
+    global STRICT_MATMUL
+    STRICT_MATMUL = bool(ckpt.get("engine", {}).get("STRICT_MATMUL", STRICT_MATMUL))
+    eng.logit_gain = float(ckpt.get("engine", {}).get("logit_gain", eng.logit_gain))
+    eng.student.load_state(ckpt["student_state"])
+    eng.teacher.load_state(ckpt["teacher_state"])
+    eng.teacher.cfg = TeacherCfg(**ckpt.get("teacher_cfg", asdict(eng.teacher.cfg)))
+    eng.student_mem_cfg = MemoryCfg(**ckpt.get("student_mem_cfg", asdict(eng.student_mem_cfg)))
+    eng.student_mem = EpisodicMemory(r=eng.r, V=eng.V, cfg=eng.student_mem_cfg, seed=777 + eng.seed)
+    eng.student_mem.load_state(ckpt.get("student_mem_state"))
+    tok_state = ckpt.get("tokenizer_state")
+    if tok_state is not None:
+        tok = SpiralTokenizer.from_state(tok_state)
+        if tok.vocab_size != eng.V:
+            raise ValueError(f"Tokenizer vocab {tok.vocab_size} != engine V {eng.V}")
+        eng.tokenizer = tok
+    g = ckpt.get("galois")
+    if g is not None:
+        eng.galois.mu_buf = [x for x in np.array(g.get("mu_buf", []), dtype=np.float64)] if np.array(g.get("mu_buf", [])).size else []
+        eng.galois.S_buf = [x for x in np.array(g.get("S_buf", []), dtype=np.float64)] if np.array(g.get("S_buf", [])).size else []
+        eng.galois._step = int(g.get("_step", 0))
+        eng.galois.hazard_ema = float(g.get("hazard_ema", 0.0))
+        eng.galois._Q = np.array(g.get("_Q", np.eye(eng.r) * 1e-3), dtype=np.float64)
+        eng.galois.pade = PadeSpec(**g.get("pade", asdict(eng.galois.pade)))
+        eng.galois.policy = GaloisPolicy(**g.get("policy", asdict(eng.galois.policy)))
+        eng.galois.window = int(g.get("window", eng.galois.window))
+        eng.galois.period = int(g.get("period", eng.galois.period))
+        eng.galois.ema = float(g.get("ema", eng.galois.ema))
+        if g.get("has_map", False):
+            num_basis = build_poly_basis(eng.r, PolySpec(deg=eng.galois.pade.p_deg, include_const=True), for_den=False)
+            den_basis = build_poly_basis(eng.r, PolySpec(deg=eng.galois.pade.q_deg, include_const=False), for_den=True)
+            eng.galois._map = RationalPadeMap(W=np.array(g.get("map_W")), V=np.array(g.get("map_V")),
+                                              num_basis=num_basis, den_basis=den_basis)
+    step = int(ckpt.get("step", 0))
+    np_state = ckpt.get("np_rng_state")
+    return step, np_state
+
     @classmethod
     def load(cls, path: str, allow_pickle: bool = False) -> "SpiralV9":
         try:
