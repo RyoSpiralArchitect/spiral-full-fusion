@@ -548,7 +548,8 @@ class SpiralTokenizer:
 def make_bigram(V: int, seed: int = 0, latent: int = 8) -> np.ndarray:
     rng = np.random.default_rng(seed)
     F = rng.normal(0, 1, size=(V, latent)).astype(np.float32)
-    S = (F @ F.T) / max(1, latent**0.5)
+    den = max(1.0, float(latent) ** 0.5)
+    S = safe_matmul(F, F.T) / den
     for i in range(V):
         for j in range(1, 4):
             S[i, (i + j) % V] += 1.5 / j
@@ -2734,6 +2735,7 @@ def apply_checkpoint(eng: SpiralV9, ckpt: Dict[str, Any], restore_strict: bool =
     np_state = ckpt.get("np_rng_state")
     return step, np_state
 
+class SpiralV9(SpiralV9):
     def generate(self, prompt_ids: np.ndarray, max_new_tokens: int = 32,
                  temperature: float = 1.0, top_p: float = 0.9, top_k: Optional[int] = None,
                  rng_seed: Optional[int] = None,
