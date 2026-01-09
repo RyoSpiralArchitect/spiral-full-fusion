@@ -1,6 +1,6 @@
 # SpiralFullFusion Toy
 
-A single-file, NumPy-only mad science lab where a reliability-obsessed teacher and a rank-clipped student co-evolve under RAG jolts, variance-forged temperatures, and hazard-triggered capacity flips. Tiny, loud, and hell-bent on stress-testing calibration hacks in the smallest loop we could get away with.
+A single-file, NumPy-only lab where a reliability-obsessed teacher and a rank-clipped student co-evolve under RAG jolts, variance-forged temperatures, and hazard-triggered capacity flips. Tiny, loud, and hell-bent on stress-testing calibration hacks in the smallest loop we could get away with.
 
 ## Why it’s interesting (and experimental)
 - **Reliability cult leader**: multi-head signals are fused with Bayesian precision, dominance meters, and layer hazard to decide when to prune, poke, or unleash exploration.
